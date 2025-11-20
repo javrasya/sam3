@@ -4,3 +4,10 @@ recursive-include examples *.py
 recursive-include examples *.ipynb
 recursive-include examples *.md
 recursive-include tests *.py
+recursive-include sam3/assets *.txt.gz
+recursive-include sam3/assets *.gif
+recursive-include sam3/assets *.png
+recursive-include sam3/assets *.jpg
+recursive-include sam3/assets/images *
+recursive-include sam3/assets/videos *
+recursive-include sam3/assets/veval *

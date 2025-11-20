@@ -3,8 +3,19 @@
 """Triton kernel for euclidean distance transform (EDT)"""
 
 import torch
+try:
 import triton
 import triton.language as tl
+    TRITON_AVAILABLE = hasattr(triton, 'jit')
+except (ImportError, AttributeError):
+    TRITON_AVAILABLE = False
+    triton = None
+    tl = None
+
+# Fallback to OpenCV if triton is not available
+if not TRITON_AVAILABLE:
+    import cv2
+    import numpy as np
 
 """
 Disclaimer: This implementation is not meant to be extremely efficient. A CUDA kernel would likely be more efficient.
@@ -50,6 +61,7 @@ Overall, despite being quite naive, this implementation is roughly 5.5x faster t
 """
 
 
+if TRITON_AVAILABLE:
 @triton.jit
 def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.constexpr):
     # This is a somewhat verbatim implementation of the efficient 1D EDT algorithm described above
@@ -126,6 +138,21 @@ def edt_triton(data: torch.Tensor):
         It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
     """
     assert data.dim() == 3
+    
+    # Fallback to OpenCV if triton is not available (e.g., ROCm)
+    if not TRITON_AVAILABLE:
+        device = data.device
+        data_np = data.cpu().numpy().astype(np.uint8)
+        B, H, W = data_np.shape
+        results = []
+        for b in range(B):
+            # OpenCV distanceTransform expects uint8 binary image
+            dist = cv2.distanceTransform(data_np[b], cv2.DIST_L2, 0)
+            results.append(dist)
+        output = torch.from_numpy(np.stack(results)).float().to(device)
+        return output
+    
+    # Original triton implementation
     assert data.is_cuda
     B, H, W = data.shape
     data = data.contiguous()
