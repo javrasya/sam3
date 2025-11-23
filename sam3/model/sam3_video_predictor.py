@@ -72,6 +72,13 @@ class Sam3VideoPredictor:
                 bounding_box_labels=request.get("bounding_box_labels", None),
                 obj_id=request.get("obj_id", None),
             )
+        elif request_type == "add_new_mask":
+            return self.add_new_mask(
+                session_id=request["session_id"],
+                frame_idx=request["frame_index"],
+                obj_id=request["obj_id"],
+                mask=request["mask"],
+            )
         elif request_type == "remove_object":
             return self.remove_object(
                 session_id=request["session_id"],
@@ -157,6 +164,28 @@ class Sam3VideoPredictor:
             boxes_xywh=bounding_boxes,
             box_labels=bounding_box_labels,
             obj_id=obj_id,
+        )
+        return {"frame_index": frame_idx, "outputs": outputs}
+
+    def add_new_mask(
+        self,
+        session_id: str,
+        frame_idx: int,
+        obj_id: int,
+        mask,  # numpy array or torch tensor
+    ):
+        """Add a mask prompt on a specific video frame."""
+        logger.debug(
+            f"add mask on frame {frame_idx} in session {session_id} for object {obj_id}"
+        )
+        session = self._get_session(session_id)
+        inference_state = session["state"]
+
+        frame_idx, outputs = self.model.add_new_mask(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask=mask,
         )
         return {"frame_index": frame_idx, "outputs": outputs}
 
