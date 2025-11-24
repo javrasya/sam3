@@ -47,7 +47,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         self.non_overlap_masks_for_output = non_overlap_masks_for_output
 
         self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        # self.bf16_context.__enter__()  # keep using for the entire model process
+        self.bf16_context.__enter__()  # keep using for the entire model process
 
         self.iter_use_prev_mask_pred = True
         self.add_all_frames_to_correct_as_cond = True
@@ -176,11 +176,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         return len(inference_state["obj_idx_to_id"])
 
     @torch.inference_mode()
-    def add_new_points_or_box(self, *args, **kwargs):
-        with self.bf16_context:
-            return self._add_new_points_or_box_impl(*args, **kwargs)
-
-    def _add_new_points_or_box_impl(
+    def add_new_points_or_box(
         self,
         inference_state,
         frame_idx,
@@ -343,11 +339,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         return frame_idx, obj_ids, low_res_masks, video_res_masks
 
     @torch.inference_mode()
-    def add_new_mask(self, *args, **kwargs):
-        with self.bf16_context:
-            return self._add_new_mask_impl(*args, **kwargs)
-
-    def _add_new_mask_impl(
+    def add_new_mask(
         self,
         inference_state,
         frame_idx,
@@ -796,11 +788,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         return processing_order
 
     @torch.inference_mode()
-    def propagate_in_video(self, *args, **kwargs):
-        with self.bf16_context:
-            yield from self._propagate_in_video_impl(*args, **kwargs)
-
-    def _propagate_in_video_impl(
+    def propagate_in_video(
         self,
         inference_state,
         start_frame_idx,
