@@ -1117,9 +1117,15 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                         if self.rank == obj_rank:
                             # This GPU has the object, broadcast its data
                             data_to_broadcast = local_obj_data.get(obj_id, None)
-                            data_list = [
-                                (data_to_broadcast[0].cpu(), data_to_broadcast[1].cpu())
-                            ]
+                            if data_to_broadcast is not None:
+                                data_list = [
+                                    (
+                                        data_to_broadcast[0].cpu(),
+                                        data_to_broadcast[1].cpu(),
+                                    )
+                                ]
+                            else:
+                                data_list = [None]
                             self.broadcast_python_obj_cpu(data_list, src=obj_rank)
                             if data_to_broadcast is not None:
                                 refined_obj_data[obj_id] = data_to_broadcast
@@ -1127,10 +1133,11 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                             # This GPU doesn't have the object, receive data
                             data_list = [None]
                             self.broadcast_python_obj_cpu(data_list, src=obj_rank)
-                            refined_obj_data[obj_id] = (
-                                data_list[0][0].to(self.device),
-                                data_list[0][1].to(self.device),
-                            )
+                            if data_list[0] is not None:
+                                refined_obj_data[obj_id] = (
+                                    data_list[0][0].to(self.device),
+                                    data_list[0][1].to(self.device),
+                                )
                 else:
                     # Single GPU case
                     refined_obj_data = local_obj_data
@@ -1754,7 +1761,10 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         if self.world_size > 1:
             data_list = [new_mask_data.cpu() if new_mask_data is not None else None]
             self.broadcast_python_obj_cpu(data_list, src=obj_rank)
-            new_mask_data = data_list[0].to(self.device)
+            if data_list[0] is not None:
+                new_mask_data = data_list[0].to(self.device)
+            else:
+                new_mask_data = None
 
         if self.rank == 0:
             obj_id_to_mask = self._build_tracker_output(
