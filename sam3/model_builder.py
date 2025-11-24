@@ -788,18 +788,6 @@ def build_sam3_video_model(
 
 
 def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
-    """
-    Build a SAM3 video predictor. Automatically selects the appropriate class:
-    - Sam3VideoPredictor for single GPU (no overhead)
-    - Sam3VideoPredictorMultiGPU for multiple GPUs (distributed inference)
-    """
-    if gpus_to_use is None:
-        gpus_to_use = [torch.cuda.current_device()]
-    
-    # Use the simpler class for single GPU to avoid unnecessary overhead
-    if len(gpus_to_use) == 1:
-        return Sam3VideoPredictor(*model_args, **model_kwargs)
-    else:
-        return Sam3VideoPredictorMultiGPU(
-            *model_args, gpus_to_use=gpus_to_use, **model_kwargs
-        )
+    return Sam3VideoPredictorMultiGPU(
+        *model_args, gpus_to_use=gpus_to_use, **model_kwargs
+    )
