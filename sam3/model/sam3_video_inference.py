@@ -1343,6 +1343,10 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         return states
 
     def _prepare_backbone_feats(self, inference_state, frame_idx, reverse):
+        import time
+        logger.info(f"_prepare_backbone_feats: starting for frame {frame_idx}")
+        t0 = time.time()
+
         input_batch = inference_state["input_batch"]
         feature_cache = inference_state["feature_cache"]
         num_frames = inference_state["num_frames"]
@@ -1351,6 +1355,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             if inference_state["per_frame_geometric_prompt"][frame_idx] is None
             else inference_state["per_frame_geometric_prompt"][frame_idx]
         )
+        logger.info(f"_prepare_backbone_feats: calling run_backbone_and_detection for frame {frame_idx}")
         _ = self.run_backbone_and_detection(
             frame_idx=frame_idx,
             num_frames=num_frames,
@@ -1360,6 +1365,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             reverse=reverse,
             allow_new_detections=True,
         )
+        logger.info(f"_prepare_backbone_feats: completed frame {frame_idx} in {time.time()-t0:.2f}s")
 
     @torch.inference_mode()
     def add_prompt(

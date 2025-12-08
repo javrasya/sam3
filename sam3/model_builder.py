@@ -33,6 +33,7 @@ from sam3.model.position_encoding import PositionEmbeddingSine
 from sam3.model.sam1_task_predictor import SAM3InteractiveImagePredictor
 from sam3.model.sam3_image import Sam3Image, Sam3ImageOnVideoMultiGPU
 from sam3.model.sam3_tracking_predictor import Sam3TrackerPredictor
+from sam3.model.sam3_unified_processor import Sam3UnifiedProcessor
 from sam3.model.sam3_video_inference import Sam3VideoInferenceWithInstanceInteractivity
 from sam3.model.sam3_video_predictor import Sam3VideoPredictor, Sam3VideoPredictorMultiGPU
 from sam3.model.text_encoder_ve import VETextEncoder
@@ -790,4 +791,69 @@ def build_sam3_video_model(
 def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
     return Sam3VideoPredictorMultiGPU(
         *model_args, gpus_to_use=gpus_to_use, **model_kwargs
+    )
+
+
+def build_sam3_unified_processor(
+    checkpoint_path=None,
+    load_from_HF=True,
+    bpe_path=None,
+    device="cuda",
+    detection_confidence_threshold=0.5,
+    **model_kwargs,
+) -> Sam3UnifiedProcessor:
+    """
+    Build SAM3 unified processor for both high-precision detection and video tracking.
+
+    This processor follows a STATELESS design pattern (like Sam3Processor):
+    - All state is passed explicitly as a dict
+    - Functions take state in, return state out
+    - User controls state lifetime
+
+    Capabilities:
+    1. High-precision DETR detection via set_image/set_text_prompt/add_*_prompt
+    2. Temporal tracking via set_video/add_prompt_on_frame/propagate
+    3. Hybrid workflow via propagate + refine_all_frames
+
+    The backbone is shared between detection and tracking, making this more
+    memory-efficient than using separate Sam3Processor and Sam3VideoPredictor.
+
+    Args:
+        checkpoint_path: Optional path to model checkpoint
+        load_from_HF: Whether to load checkpoint from HuggingFace if no path provided
+        bpe_path: Path to the BPE tokenizer vocabulary file
+        device: Device to load the model on ('cuda' or 'cpu')
+        detection_confidence_threshold: Confidence threshold for detection filtering
+        **model_kwargs: Additional arguments passed to build_sam3_video_model()
+
+    Returns:
+        Sam3UnifiedProcessor: A unified processor with both detection and tracking
+
+    Example - Detection:
+        >>> processor = build_sam3_unified_processor()
+        >>> state = processor.set_image(image)
+        >>> state = processor.set_text_prompt("person", state)
+        >>> state = processor.add_point_prompt([0.5, 0.5], label=1, state=state)
+        >>> masks = state["masks"]
+
+    Example - Video:
+        >>> state = processor.set_video(video_path)
+        >>> state = processor.add_prompt_on_frame(0, state, text="dog")
+        >>> state = processor.propagate(state)
+        >>> state = processor.refine_all_frames(state, refine_every_n=10)
+        >>> all_masks = processor.get_masks(state)
+    """
+    # Build the underlying video model
+    model = build_sam3_video_model(
+        checkpoint_path=checkpoint_path,
+        load_from_HF=load_from_HF,
+        bpe_path=bpe_path,
+        device=device,
+        **model_kwargs,
+    )
+
+    # Wrap in unified processor
+    return Sam3UnifiedProcessor(
+        model=model,
+        detection_confidence_threshold=detection_confidence_threshold,
     )

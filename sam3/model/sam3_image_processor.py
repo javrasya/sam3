@@ -14,7 +14,14 @@ from torchvision.transforms import v2
 class Sam3Processor:
     """ """
 
-    def __init__(self, model, resolution=1008, device="cuda", confidence_threshold=0.5):
+    def __init__(
+        self,
+        model,
+        resolution=1008,
+        device="cuda",
+        confidence_threshold=0.5,
+        text_cache_size: int = 100,
+    ):
         self.model = model
         self.resolution = resolution
         self.device = device
@@ -28,6 +35,10 @@ class Sam3Processor:
         )
         self.confidence_threshold = confidence_threshold
 
+        # Text embedding cache for faster repeated prompts
+        self._text_cache: Dict[str, Dict] = {}
+        self._text_cache_size = text_cache_size
+
         self.find_stage = FindStage(
             img_ids=torch.tensor([0], device=device, dtype=torch.long),
             text_ids=torch.tensor([0], device=device, dtype=torch.long),
@@ -37,6 +48,84 @@ class Sam3Processor:
             input_points=None,
             input_points_mask=None,
         )
+
+    def _get_text_embeddings(self, prompt: str) -> Dict:
+        """Get text embeddings, using cache if available."""
+        if prompt in self._text_cache:
+            return self._text_cache[prompt]
+
+        text_outputs = self.model.backbone.forward_text([prompt], device=self.device)
+
+        # Evict oldest entry if cache is full
+        if len(self._text_cache) >= self._text_cache_size:
+            oldest_key = next(iter(self._text_cache))
+            del self._text_cache[oldest_key]
+
+        self._text_cache[prompt] = text_outputs
+        return text_outputs
+
+    def clear_text_cache(self):
+        """Clear the text embedding cache."""
+        self._text_cache.clear()
+
+    @torch.inference_mode()
+    def warmup(
+        self,
+        prompts: List[str] = None,
+        warmup_boxes: bool = True,
+        warmup_points: bool = True,
+    ):
+        """Warm up the model by running dummy inference.
+
+        This triggers CUDA kernel compilation and optionally pre-caches text embeddings.
+
+        Args:
+            prompts: Optional list of text prompts to pre-cache embeddings for
+            warmup_boxes: Whether to warm up box prompt inference path
+            warmup_points: Whether to warm up point prompt inference path
+        """
+        # Create dummy image tensor at the expected resolution
+        dummy_image = torch.zeros(
+            3, self.resolution, self.resolution, device=self.device
+        )
+
+        # Run backbone forward
+        state = self.set_image(dummy_image)
+
+        # Run text encoder and grounding with dummy prompt
+        state = self.set_text_prompt("warmup", state)
+
+        # Warm up box prompt path
+        if warmup_boxes:
+            self.reset_all_prompts(state)
+            state = self.add_geometric_prompt(
+                box=[0.5, 0.5, 0.2, 0.2], label=True, state=state
+            )
+
+        # Warm up point prompt path
+        if warmup_points:
+            self.reset_all_prompts(state)
+            state = self.add_point_prompt(point=[0.5, 0.5], label=1, state=state)
+
+        # Warm up combined prompts path (set_all_prompts)
+        if warmup_boxes or warmup_points:
+            self.reset_all_prompts(state)
+            state = self.set_all_prompts(
+                state,
+                text="warmup",
+                points=[[0.5, 0.5]] if warmup_points else None,
+                point_labels=[1] if warmup_points else None,
+                boxes=[[0.5, 0.5, 0.2, 0.2]] if warmup_boxes else None,
+                box_labels=[True] if warmup_boxes else None,
+            )
+
+        # Pre-cache additional text prompts if provided
+        if prompts:
+            for prompt in prompts:
+                self._get_text_embeddings(prompt)
+
+        # Synchronize to ensure all CUDA kernels are compiled
+        torch.cuda.synchronize()
 
     @torch.inference_mode()
     def set_image(self, image, state=None):
@@ -116,7 +205,7 @@ class Sam3Processor:
         if "backbone_out" not in state:
             raise ValueError("You must call set_image before set_text_prompt")
 
-        text_outputs = self.model.backbone.forward_text([prompt], device=self.device)
+        text_outputs = self._get_text_embeddings(prompt)
         # will erase the previous text prompt if any
         state["backbone_out"].update(text_outputs)
         if "geometric_prompt" not in state:
@@ -136,9 +225,7 @@ class Sam3Processor:
 
         if "language_features" not in state["backbone_out"]:
             # Looks like we don't have a text prompt yet. This is allowed, but we need to set the text prompt to "visual" for the model to rely only on the geometric prompt
-            dummy_text_outputs = self.model.backbone.forward_text(
-                ["visual"], device=self.device
-            )
+            dummy_text_outputs = self._get_text_embeddings("visual")
             state["backbone_out"].update(dummy_text_outputs)
 
         if "geometric_prompt" not in state:
@@ -148,6 +235,31 @@ class Sam3Processor:
         boxes = torch.tensor(box, device=self.device, dtype=torch.float32).view(1, 1, 4)
         labels = torch.tensor([label], device=self.device, dtype=torch.bool).view(1, 1)
         state["geometric_prompt"].append_boxes(boxes, labels)
+
+        return self._forward_grounding(state)
+
+    @torch.inference_mode()
+    def add_point_prompt(self, point: List, label: int, state: Dict):
+        """Adds a point prompt and run the inference.
+        The image needs to be set, but not necessarily the text prompt.
+        The point is assumed to be in [x, y] format and normalized in [0, 1] range.
+        The label is 1 for a positive point (foreground), 0 for a negative point (background).
+        """
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before add_point_prompt")
+
+        if "language_features" not in state["backbone_out"]:
+            # Looks like we don't have a text prompt yet. This is allowed, but we need to set the text prompt to "visual" for the model to rely only on the geometric prompt
+            dummy_text_outputs = self._get_text_embeddings("visual")
+            state["backbone_out"].update(dummy_text_outputs)
+
+        if "geometric_prompt" not in state:
+            state["geometric_prompt"] = self.model._get_dummy_prompt()
+
+        # adding a sequence and batch dimension (sequence first, batch second)
+        points = torch.tensor(point, device=self.device, dtype=torch.float32).view(1, 1, 2)
+        labels = torch.tensor([label], device=self.device, dtype=torch.long).view(1, 1)
+        state["geometric_prompt"].append_points(points, labels)
 
         return self._forward_grounding(state)
 
@@ -167,6 +279,85 @@ class Sam3Processor:
         for key in keys_to_del:
             if key in state:
                 del state[key]
+
+    @torch.inference_mode()
+    def set_all_prompts(
+        self,
+        state: Dict,
+        text: str = None,
+        points: List[List] = None,
+        point_labels: List[int] = None,
+        boxes: List[List] = None,
+        box_labels: List[bool] = None,
+    ):
+        """Sets all prompts at once and runs inference only once.
+
+        This is more efficient than calling individual prompt methods when
+        rebuilding prompts after removal, as it avoids repeated _forward_grounding calls.
+
+        Args:
+            state: The inference state from set_image()
+            text: Text prompt string, or None
+            points: List of [x, y] points normalized in [0, 1], or None
+            point_labels: List of labels (1=foreground, 0=background) for each point
+            boxes: List of [center_x, center_y, width, height] normalized in [0, 1], or None
+            box_labels: List of labels (True=positive, False=negative) for each box
+
+        Returns:
+            Updated state with inference results
+        """
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before set_all_prompts")
+
+        # Reset existing prompts first
+        self.reset_all_prompts(state)
+
+        # Check if we have any geometric prompts
+        has_points = points is not None and len(points) > 0
+        has_boxes = boxes is not None and len(boxes) > 0
+        has_geometric = has_points or has_boxes
+
+        # Set text prompt (or dummy "visual" if only geometric prompts)
+        if text is not None:
+            text_outputs = self._get_text_embeddings(text)
+            state["backbone_out"].update(text_outputs)
+        elif has_geometric:
+            dummy_text_outputs = self._get_text_embeddings("visual")
+            state["backbone_out"].update(dummy_text_outputs)
+        else:
+            # No prompts at all
+            return state
+
+        # Initialize geometric prompt
+        state["geometric_prompt"] = self.model._get_dummy_prompt()
+
+        # Add all points
+        if has_points:
+            if point_labels is None or len(point_labels) != len(points):
+                raise ValueError("point_labels must match length of points")
+            for point, label in zip(points, point_labels):
+                pt = torch.tensor(point, device=self.device, dtype=torch.float32).view(
+                    1, 1, 2
+                )
+                lbl = torch.tensor([label], device=self.device, dtype=torch.long).view(
+                    1, 1
+                )
+                state["geometric_prompt"].append_points(pt, lbl)
+
+        # Add all boxes
+        if has_boxes:
+            if box_labels is None or len(box_labels) != len(boxes):
+                raise ValueError("box_labels must match length of boxes")
+            for box, label in zip(boxes, box_labels):
+                bx = torch.tensor(box, device=self.device, dtype=torch.float32).view(
+                    1, 1, 4
+                )
+                lbl = torch.tensor([label], device=self.device, dtype=torch.bool).view(
+                    1, 1
+                )
+                state["geometric_prompt"].append_boxes(bx, lbl)
+
+        return self._forward_grounding(state)
 
     @torch.inference_mode()
     def set_confidence_threshold(self, threshold: float, state=None):
