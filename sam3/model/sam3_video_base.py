@@ -321,17 +321,17 @@ class Sam3VideoBase(nn.Module):
     ):
         import time
         t_start = time.time()
-        logger.info(f"run_backbone_and_detection: frame {frame_idx} starting")
+        logger.debug(f"run_backbone_and_detection: frame {frame_idx} starting")
 
         # Step 1: if text feature is not cached in `feature_cache`, compute and cache it
         text_batch_key = tuple(input_batch.find_text_batch)
         if "text" not in feature_cache or text_batch_key not in feature_cache["text"]:
-            logger.info(f"run_backbone_and_detection: computing text features...")
+            logger.debug(f"run_backbone_and_detection: computing text features...")
             t0 = time.time()
             text_outputs = self.detector.backbone.forward_text(
                 input_batch.find_text_batch, device=self.device
             )
-            logger.info(f"run_backbone_and_detection: text features done in {time.time()-t0:.2f}s")
+            logger.debug(f"run_backbone_and_detection: text features done in {time.time()-t0:.2f}s")
             # note: we only cache the text feature of the most recent prompt
             feature_cache["text"] = {text_batch_key: text_outputs}
         else:
@@ -348,7 +348,7 @@ class Sam3VideoBase(nn.Module):
         max_frame_num_to_track = tracking_bounds.get("max_frame_num_to_track")
         start_frame_idx = tracking_bounds.get("propagate_in_video_start_frame_idx")
 
-        logger.info(f"run_backbone_and_detection: calling forward_video_grounding_multigpu...")
+        logger.debug(f"run_backbone_and_detection: calling forward_video_grounding_multigpu...")
         t0 = time.time()
         sam3_image_out, _ = self.detector.forward_video_grounding_multigpu(
             backbone_out={
@@ -371,7 +371,7 @@ class Sam3VideoBase(nn.Module):
             max_frame_num_to_track=max_frame_num_to_track,
             propagate_in_video_start_frame_idx=start_frame_idx,
         )
-        logger.info(f"run_backbone_and_detection: forward_video_grounding_multigpu done in {time.time()-t0:.2f}s")
+        logger.debug(f"run_backbone_and_detection: forward_video_grounding_multigpu done in {time.time()-t0:.2f}s")
         # note: detections in `sam3_image_out` has already gone through NMS
         pred_probs = sam3_image_out["pred_logits"].squeeze(-1).sigmoid()
         if not allow_new_detections:

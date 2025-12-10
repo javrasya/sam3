@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.ops import masks_to_boxes
 from torchvision.transforms import v2
+from tqdm.auto import tqdm
 
 from sam3.logger import get_logger
 from sam3.model.box_ops import box_cxcywh_to_xyxy
@@ -292,7 +293,11 @@ class Sam3UnifiedProcessor:
         if "geometric_prompt" not in state:
             state["geometric_prompt"] = self.model.detector._get_dummy_prompt()
 
-        boxes = self._mask_to_boxes_cxcywh(mask.squeeze())
+        mask_squeezed = mask.squeeze()
+        if mask_squeezed.numel() > 0 and mask_squeezed.any():
+            boxes = self._mask_to_boxes_cxcywh(mask_squeezed)
+        else:
+            boxes = []
         for box in boxes:
             box_t = torch.tensor(box, device=self.device, dtype=torch.float32).view(1, 1, 4)
             label_t = torch.tensor([True], device=self.device, dtype=torch.bool).view(1, 1)
@@ -386,7 +391,11 @@ class Sam3UnifiedProcessor:
             state["mask_guidance"] = mask
 
             # Also derive box from mask
-            mask_boxes = self._mask_to_boxes_cxcywh(mask.squeeze())
+            mask_squeezed = mask.squeeze()
+            if mask_squeezed.numel() > 0 and mask_squeezed.any():
+                mask_boxes = self._mask_to_boxes_cxcywh(mask_squeezed)
+            else:
+                mask_boxes = []
             for box in mask_boxes:
                 box_t = torch.tensor(box, device=self.device, dtype=torch.float32).view(1, 1, 4)
                 lbl_t = torch.tensor([True], device=self.device, dtype=torch.bool).view(1, 1)
@@ -700,15 +709,15 @@ class Sam3UnifiedProcessor:
             # Pre-compute backbone features for seed mask frames
             # The tracker needs cached features to run inference
             seed_frame_indices = sorted(state["seed_masks"].keys())
-            logger.info(f"Pre-computing backbone features for seed frames: {seed_frame_indices}")
+            logger.debug(f"Pre-computing backbone features for seed frames: {seed_frame_indices}")
             for i, frame_idx in enumerate(seed_frame_indices):
                 if frame_idx not in inference_state.get("feature_cache", {}):
                     # Run backbone to cache features for this frame
-                    logger.info(f"Computing backbone features for frame {frame_idx} ({i+1}/{len(seed_frame_indices)})...")
+                    logger.debug(f"Computing backbone features for frame {frame_idx} ({i+1}/{len(seed_frame_indices)})...")
                     t0 = time.time()
                     self.model._prepare_backbone_feats(inference_state, frame_idx, reverse=False)
                     elapsed = time.time() - t0
-                    logger.info(f"Cached backbone features for frame {frame_idx} in {elapsed:.2f}s")
+                    logger.debug(f"Cached backbone features for frame {frame_idx} in {elapsed:.2f}s")
 
             # Create a single tracker state for all objects if not already present
             if len(inference_state.get("tracker_inference_states", [])) == 0:
@@ -721,20 +730,20 @@ class Sam3UnifiedProcessor:
             for frame_idx, obj_masks in state["seed_masks"].items():
                 for obj_id, mask in obj_masks.items():
                     mask_2d = _prepare_mask_for_tracker(mask)
-                    logger.info(f"Adding seed mask for obj_id={obj_id} on frame {frame_idx}, shape={mask_2d.shape}")
+                    logger.debug(f"Adding seed mask for obj_id={obj_id} on frame {frame_idx}, shape={mask_2d.shape}")
 
                     # Convert to tensor for tracker
                     mask_tensor = torch.from_numpy(mask_2d).to(self.device)
 
                     # Call tracker's add_new_mask directly
-                    logger.info(f"Calling tracker.add_new_mask for obj_id={obj_id} frame={frame_idx}...")
+                    logger.debug(f"Calling tracker.add_new_mask for obj_id={obj_id} frame={frame_idx}...")
                     result = self.model.tracker.add_new_mask(
                         inference_state=tracker_state,
                         frame_idx=frame_idx,
                         obj_id=obj_id,
                         mask=mask_tensor,
                     )
-                    logger.info(f"tracker.add_new_mask completed: frame_idx={result[0]}, obj_ids={result[1]}")
+                    logger.debug(f"tracker.add_new_mask completed: frame_idx={result[0]}, obj_ids={result[1]}")
 
         # Determine start frame
         cond_frames = set(state.get("frame_masks", {}).keys()) | set(state.get("seed_masks", {}).keys())
@@ -751,11 +760,11 @@ class Sam3UnifiedProcessor:
 
         # Debug: Check action history
         action_history = inference_state.get("action_history", [])
-        logger.info(f"Action history: {[(a.get('type'), a.get('obj_ids'), a.get('frame_idx')) for a in action_history]}")
+        logger.debug(f"Action history: {[(a.get('type'), a.get('obj_ids'), a.get('frame_idx')) for a in action_history]}")
 
         # Debug: Check tracker metadata
         tracker_metadata = inference_state.get("tracker_metadata", {})
-        logger.info(f"Tracker metadata obj_ids: {tracker_metadata.get('obj_ids_all_gpu', [])}")
+        logger.debug(f"Tracker metadata obj_ids: {tracker_metadata.get('obj_ids_all_gpu', [])}")
 
         # Debug: Check tracker state internals
         for i, ts in enumerate(inference_state.get("tracker_inference_states", [])):
@@ -764,7 +773,7 @@ class Sam3UnifiedProcessor:
             obj_ids = ts.get("obj_ids", [])
             temp_cond = {k: list(v.get("cond_frame_outputs", {}).keys())
                         for k, v in ts.get("temp_output_dict_per_obj", {}).items()}
-            logger.info(
+            logger.debug(
                 f"Tracker state {i}: obj_ids={obj_ids}, "
                 f"cond_frames={cond_frames}, non_cond_frames={non_cond_frames}, "
                 f"temp_cond_per_obj={temp_cond}"
@@ -772,7 +781,7 @@ class Sam3UnifiedProcessor:
             if len(cond_frames) == 0 and len(non_cond_frames) == 0:
                 logger.warning(f"Tracker state {i} has NO conditioning frames! Mask add may have failed.")
 
-        logger.info(f"Propagating with {num_tracker_states} tracker state(s), starting from frame {start_frame}")
+        logger.debug(f"Propagating with {num_tracker_states} tracker state(s), starting from frame {start_frame}")
 
         # Propagate
         state["propagated_masks"] = {}
@@ -793,9 +802,9 @@ class Sam3UnifiedProcessor:
                     tracker_state = inference_state["tracker_inference_states"][0]
 
                     # Call preflight to consolidate temp outputs to cond_frame_outputs
-                    logger.info(f"Calling propagate_in_video_preflight...")
+                    logger.debug(f"Calling propagate_in_video_preflight...")
                     self.model.tracker.propagate_in_video_preflight(tracker_state, run_mem_encoder=True)
-                    logger.info(f"Preflight done, cond_frames: {list(tracker_state.get('output_dict', {}).get('cond_frame_outputs', {}).keys())}")
+                    logger.debug(f"Preflight done, cond_frames: {list(tracker_state.get('output_dict', {}).get('cond_frame_outputs', {}).keys())}")
 
                     # Get processing order (same logic as tracker's propagate_in_video)
                     num_frames = state.get("num_frames", inference_state["num_frames"])
@@ -820,8 +829,8 @@ class Sam3UnifiedProcessor:
                     # Track the previous frame to determine direction
                     prev_frame_idx = None
 
-                    logger.info(f"Starting frame processing loop with {len(processing_order)} frames: first={processing_order[0] if processing_order else 'N/A'}, last={processing_order[-1] if processing_order else 'N/A'}")
-                    for frame_idx in processing_order:
+                    logger.debug(f"Starting frame processing loop with {len(processing_order)} frames: first={processing_order[0] if processing_order else 'N/A'}, last={processing_order[-1] if processing_order else 'N/A'}")
+                    for frame_idx in tqdm(processing_order, desc="propagate in video"):
                         # Determine if this is a reverse step
                         if prev_frame_idx is not None:
                             is_reverse = (frame_idx < prev_frame_idx)
@@ -832,9 +841,9 @@ class Sam3UnifiedProcessor:
                         # Pre-compute backbone features for this frame if not cached
                         feature_cache = inference_state.get("feature_cache", {})
                         if frame_idx not in feature_cache or "tracker_backbone_out" not in feature_cache.get(frame_idx, (None, {}))[1]:
-                            logger.info(f"Computing backbone features for frame {frame_idx}...")
+                            logger.debug(f"Computing backbone features for frame {frame_idx}...")
                             self.model._prepare_backbone_feats(inference_state, frame_idx, reverse=is_reverse)
-                            logger.info(f"Computed backbone features for frame {frame_idx}")
+                            logger.debug(f"Computed backbone features for frame {frame_idx}")
 
                         # Check if this frame is already in consolidated outputs (conditioning frame)
                         if frame_idx in consolidated_cond:
@@ -851,8 +860,7 @@ class Sam3UnifiedProcessor:
                             # Run tracker inference on this frame
                             storage_key = "non_cond_frame_outputs"
                             batch_size = self.model.tracker._get_obj_num(tracker_state)
-                            if frame_idx % 10 == 0 or frame_idx < 3:
-                                logger.info(f"Running tracker inference on frame {frame_idx} (batch_size={batch_size})...")
+                            logger.debug(f"Running tracker inference on frame {frame_idx} (batch_size={batch_size})...")
                             current_out, pred_masks = self.model.tracker._run_single_frame_inference(
                                 inference_state=tracker_state,
                                 output_dict=output_dict,
@@ -1049,7 +1057,10 @@ class Sam3UnifiedProcessor:
                 det_state = self.add_mask_prompt(combined_mask, det_state)
             else:
                 # Fallback to box guidance
-                boxes = self._mask_to_boxes_cxcywh(cropped_guidance)
+                if cropped_guidance.numel() > 0 and cropped_guidance.any():
+                    boxes = self._mask_to_boxes_cxcywh(cropped_guidance)
+                else:
+                    boxes = []
                 for box in boxes:
                     det_state = self.add_box_prompt(box, True, det_state)
 
@@ -1088,7 +1099,10 @@ class Sam3UnifiedProcessor:
                 det_state = self.add_mask_prompt(combined_mask, det_state)
             else:
                 # Fallback to box guidance
-                boxes = self._mask_to_boxes_cxcywh(guidance_mask)
+                if guidance_mask.numel() > 0 and guidance_mask.any():
+                    boxes = self._mask_to_boxes_cxcywh(guidance_mask)
+                else:
+                    boxes = []
                 for box in boxes:
                     det_state = self.add_box_prompt(box, True, det_state)
 
