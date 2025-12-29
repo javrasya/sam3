@@ -735,6 +735,13 @@ class Sam3UnifiedProcessor:
                     # Convert to tensor for tracker
                     mask_tensor = torch.from_numpy(mask_2d).to(self.device)
 
+                    # Ensure backbone features are cached for this frame before calling add_new_mask
+                    # (the pre-compute loop should have done this, but we double-check here as a safety measure)
+                    feature_cache = inference_state.get("feature_cache", {})
+                    if frame_idx not in feature_cache or "tracker_backbone_out" not in feature_cache.get(frame_idx, (None, {}))[1]:
+                        logger.info(f"Computing backbone features for frame {frame_idx} (not cached, computing before add_new_mask)...")
+                        self.model._prepare_backbone_feats(inference_state, frame_idx, reverse=False)
+
                     # Call tracker's add_new_mask directly
                     logger.debug(f"Calling tracker.add_new_mask for obj_id={obj_id} frame={frame_idx}...")
                     result = self.model.tracker.add_new_mask(

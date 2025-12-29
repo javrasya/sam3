@@ -36,7 +36,7 @@ def send_generate_request(
     server_url=None,
     model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
     api_key=None,
-    max_tokens=4096,
+    max_tokens=1024,
 ):
     """
     Sends a request to the OpenAI-compatible API endpoint using the OpenAI client library.
@@ -45,7 +45,7 @@ def send_generate_request(
         server_url (str): The base URL of the server, e.g. "http://127.0.0.1:8000"
         messages (list): A list of message dicts, each containing role and content.
         model (str): The model to use for generation (default: "llama-4")
-        max_tokens (int): Maximum number of tokens to generate (default: 4096)
+        max_tokens (int): Maximum number of tokens to generate (default: 1024)
 
     Returns:
         str: The generated response text from the server.

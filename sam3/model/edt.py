@@ -1,10 +1,22 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
-"""Triton kernel for euclidean distance transform (EDT)"""
+"""Triton kernel for euclidean distance transform (EDT) with OpenCV fallback for Windows"""
 
+import logging
 import torch
-import triton
-import triton.language as tl
+import sys
+
+logger = logging.getLogger(__name__)
+
+# Try to import triton, fall back to OpenCV-based implementation on Windows
+TRITON_AVAILABLE = False
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+    logger.info("Triton available - using fast GPU EDT kernel")
+except ImportError:
+    logger.warning("Triton not available - falling back to slow OpenCV EDT (5.5x slower)")
 
 """
 Disclaimer: This implementation is not meant to be extremely efficient. A CUDA kernel would likely be more efficient.
@@ -49,81 +61,74 @@ Overall, despite being quite naive, this implementation is roughly 5.5x faster t
 
 """
 
+if TRITON_AVAILABLE:
+    @triton.jit
+    def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.constexpr):
+        # This is a somewhat verbatim implementation of the efficient 1D EDT algorithm described above
+        # It can be applied horizontally or vertically depending if we're doing the first or second stage.
+        # It's parallelized across batch+row (or batch+col if horizontal=False)
+        # TODO: perhaps the implementation can be revisited if/when local gather/scatter become available in triton
+        batch_id = tl.program_id(axis=0)
+        if horizontal:
+            row_id = tl.program_id(axis=1)
+            block_start = (batch_id * height * width) + row_id * width
+            length = width
+            stride = 1
+        else:
+            col_id = tl.program_id(axis=1)
+            block_start = (batch_id * height * width) + col_id
+            length = height
+            stride = width
 
-@triton.jit
-def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.constexpr):
-    # This is a somewhat verbatim implementation of the efficient 1D EDT algorithm described above
-    # It can be applied horizontally or vertically depending if we're doing the first or second stage.
-    # It's parallelized across batch+row (or batch+col if horizontal=False)
-    # TODO: perhaps the implementation can be revisited if/when local gather/scatter become available in triton
-    batch_id = tl.program_id(axis=0)
-    if horizontal:
-        row_id = tl.program_id(axis=1)
-        block_start = (batch_id * height * width) + row_id * width
-        length = width
-        stride = 1
-    else:
-        col_id = tl.program_id(axis=1)
-        block_start = (batch_id * height * width) + col_id
-        length = height
-        stride = width
-
-    # This will be the index of the right most parabola in the envelope ("the top of the stack")
-    k = 0
-    for q in range(1, length):
-        # Read the function value at the current location. Note that we're doing a singular read, not very efficient
-        cur_input = tl.load(inputs_ptr + block_start + (q * stride))
-        # location of the parabola on top of the stack
-        r = tl.load(v + block_start + (k * stride))
-        # associated boundary
-        z_k = tl.load(z + block_start + (k * stride))
-        # value of the function at the parabola location
-        previous_input = tl.load(inputs_ptr + block_start + (r * stride))
-        # intersection between the two parabolas
-        s = (cur_input - previous_input + q * q - r * r) / (q - r) / 2
-
-        # we'll pop as many parabolas as required
-        while s <= z_k and k - 1 >= 0:
-            k = k - 1
+        # This will be the index of the right most parabola in the envelope ("the top of the stack")
+        k = 0
+        for q in range(1, length):
+            # Read the function value at the current location. Note that we're doing a singular read, not very efficient
+            cur_input = tl.load(inputs_ptr + block_start + (q * stride))
+            # location of the parabola on top of the stack
             r = tl.load(v + block_start + (k * stride))
+            # associated boundary
             z_k = tl.load(z + block_start + (k * stride))
+            # value of the function at the parabola location
             previous_input = tl.load(inputs_ptr + block_start + (r * stride))
+            # intersection between the two parabolas
             s = (cur_input - previous_input + q * q - r * r) / (q - r) / 2
 
-        # Store the new one
-        k = k + 1
-        tl.store(v + block_start + (k * stride), q)
-        tl.store(z + block_start + (k * stride), s)
-        if k + 1 < length:
-            tl.store(z + block_start + ((k + 1) * stride), 1e9)
+            # we'll pop as many parabolas as required
+            while s <= z_k and k - 1 >= 0:
+                k = k - 1
+                r = tl.load(v + block_start + (k * stride))
+                z_k = tl.load(z + block_start + (k * stride))
+                previous_input = tl.load(inputs_ptr + block_start + (r * stride))
+                s = (cur_input - previous_input + q * q - r * r) / (q - r) / 2
 
-    # Last step, we read the envelope to find the min in every location
-    k = 0
-    for q in range(length):
-        while (
-            k + 1 < length
-            and tl.load(
-                z + block_start + ((k + 1) * stride), mask=(k + 1) < length, other=q
-            )
-            < q
-        ):
-            k += 1
-        r = tl.load(v + block_start + (k * stride))
-        d = q - r
-        old_value = tl.load(inputs_ptr + block_start + (r * stride))
-        tl.store(outputs_ptr + block_start + (q * stride), old_value + d * d)
+            # Store the new one
+            k = k + 1
+            tl.store(v + block_start + (k * stride), q)
+            tl.store(z + block_start + (k * stride), s)
+            if k + 1 < length:
+                tl.store(z + block_start + ((k + 1) * stride), 1e9)
+
+        # Last step, we read the envelope to find the min in every location
+        k = 0
+        for q in range(length):
+            while (
+                k + 1 < length
+                and tl.load(
+                    z + block_start + ((k + 1) * stride), mask=(k + 1) < length, other=q
+                )
+                < q
+            ):
+                k += 1
+            r = tl.load(v + block_start + (k * stride))
+            d = q - r
+            old_value = tl.load(inputs_ptr + block_start + (r * stride))
+            tl.store(outputs_ptr + block_start + (q * stride), old_value + d * d)
 
 
-def edt_triton(data: torch.Tensor):
+def _edt_triton_impl(data: torch.Tensor):
     """
-    Computes the Euclidean Distance Transform (EDT) of a batch of binary images.
-
-    Args:
-        data: A tensor of shape (B, H, W) representing a batch of binary images.
-
-    Returns:
-        A tensor of the same shape as data containing the EDT.
-        It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
+    Triton implementation of EDT - only available on Linux with triton installed.
     """
     assert data.dim() == 3
     assert data.is_cuda
@@ -171,3 +176,48 @@ def edt_triton(data: torch.Tensor):
     )
     # don't forget to take sqrt at the end
     return output.sqrt()
+
+
+def _edt_opencv_impl(data: torch.Tensor):
+    """
+    OpenCV-based fallback implementation of EDT for platforms without triton (e.g., Windows).
+    This is slower but functionally equivalent.
+    """
+    import cv2
+    import numpy as np
+    
+    assert data.dim() == 3
+    B, H, W = data.shape
+    device = data.device
+    
+    # Move to CPU for OpenCV processing
+    data_np = data.cpu().numpy()
+    output = np.zeros_like(data_np, dtype=np.float32)
+    
+    for b in range(B):
+        # OpenCV distanceTransform expects uint8 input where 0 is background
+        # Our input has True (1) where we want distance from, False (0) elsewhere
+        mask = data_np[b].astype(np.uint8)
+        # distanceTransform computes distance TO zero pixels, so we need to invert
+        # Actually, looking at the triton impl: it sets infinity where data is True
+        # So we want distance from True pixels = distance transform of inverted mask
+        output[b] = cv2.distanceTransform(mask, cv2.DIST_L2, 0)
+    
+    return torch.from_numpy(output).to(device)
+
+
+def edt_triton(data: torch.Tensor):
+    """
+    Computes the Euclidean Distance Transform (EDT) of a batch of binary images.
+
+    Args:
+        data: A tensor of shape (B, H, W) representing a batch of binary images.
+
+    Returns:
+        A tensor of the same shape as data containing the EDT.
+        It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
+    """
+    if TRITON_AVAILABLE:
+        return _edt_triton_impl(data)
+    else:
+        return _edt_opencv_impl(data)

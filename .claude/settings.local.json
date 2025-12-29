@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git show:*)",
+      "Bash(xargs -I {} sh -c \"echo ''=== {} ==='' && git diff main HEAD -- {} | grep -E ''\\(cuda|gpu|GPU|CUDA|torch.compile|jit|dtype|float32|bfloat16|\\\\.cpu\\\\\\(\\\\\\)|\\\\.cuda\\\\\\(|device='' -i | head -15\")",
+      "Bash(git diff:*)"
+    ]
+  }
+}

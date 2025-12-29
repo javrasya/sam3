@@ -84,7 +84,7 @@ train = [
 
 [tool.setuptools]
 packages = { find = {} }
-package-data = { sam3 = ["assets/**/*"] }
+package-data = { sam3 = ["assets/**/*", "agent/system_prompts/**/*"] }
 include-package-data = true
 
 [tool.setuptools.dynamic]

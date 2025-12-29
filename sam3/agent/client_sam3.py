@@ -63,18 +63,17 @@ def call_sam_service(
         text_prompt.replace("/", "_") if "/" in text_prompt else text_prompt
     )
 
-    os.makedirs(
-        os.path.join(output_folder_path, image_path.replace("/", "-")), exist_ok=True
-    )
+    # Use basename to handle both Windows and Unix paths correctly
+    image_basename = os.path.basename(image_path).replace(".", "_")
+    image_output_dir = os.path.join(output_folder_path, image_basename)
+    os.makedirs(image_output_dir, exist_ok=True)
     output_json_path = os.path.join(
-        output_folder_path,
-        image_path.replace("/", "-"),
-        rf"{text_prompt_for_save_path}.json",
+        image_output_dir,
+        f"{text_prompt_for_save_path}.json",
     )
     output_image_path = os.path.join(
-        output_folder_path,
-        image_path.replace("/", "-"),
-        rf"{text_prompt_for_save_path}.png",
+        image_output_dir,
+        f"{text_prompt_for_save_path}.png",
     )
 
     try:

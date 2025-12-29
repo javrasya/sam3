@@ -200,10 +200,11 @@ def agent_inference(
     print(f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n")
     while generated_text is not None:
         save_debug_messages(messages, debug, debug_folder_path, debug_jsonl_path)
-        assert (
-            "<tool>" in generated_text,
-            f"Generated text does not contain <tool> tag: {generated_text}",
-        )
+        # Handle empty responses from the model
+        if not generated_text or not generated_text.strip():
+            raise ValueError("Model returned an empty response. Try a different prompt or check the API key.")
+        if "<tool>" not in generated_text:
+            raise ValueError(f"Generated text does not contain <tool> tag: {generated_text}")
         generated_text = generated_text.split("</tool>", 1)[0] + "</tool>"
         tool_call_json_str = (
             generated_text.split("<tool>")[-1]
