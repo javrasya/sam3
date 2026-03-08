@@ -1649,6 +1649,357 @@ class Sam3UnifiedProcessor:
 
         return boxes_orig
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # LLM-GUIDED CROP PROPAGATION
+    # Optional mode: crop each frame around predicted object location
+    # before running tracker, improving small object segmentation quality.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @torch.inference_mode()
+    def propagate_with_llm_crop(
+        self,
+        state: Dict,
+        llm_advisor,
+        object_descriptions: Union[str, Dict[int, str]] = None,
+        direction: str = "forward",
+        llm_every_n_frames: int = 1,
+        crop_padding: float = 0.5,
+        stream: bool = False,
+    ):
+        """
+        Propagate masks through video using LLM-guided per-frame cropping.
+
+        Before each frame enters the tracker backbone, an LLM predicts where
+        the object will be. The frame is cropped around that prediction and
+        resized to model resolution (1008x1008), giving small objects much
+        higher effective resolution. Masks are mapped back to full frame
+        coordinates afterward.
+
+        This is an OPTIONAL mode. Use propagate() for standard full-frame tracking.
+
+        Args:
+            state: State from add_prompt_on_frame() or set_seed_masks()
+            llm_advisor: LLMCropAdvisor instance for crop zone prediction
+            object_descriptions: Optional text descriptions of tracked objects.
+                str for single description, or dict {obj_id: str} per object.
+            direction: "forward" or "backward" (default "forward")
+            llm_every_n_frames: How often to call the LLM (1=every frame,
+                2=every other frame with interpolation, etc.)
+            crop_padding: Extra padding factor around LLM-predicted crops
+            stream: If True, yields (frame_idx, masks_dict, state) per frame.
+                   If False, collects all results and returns state.
+
+        Returns/Yields:
+            If stream=False: State with propagated_masks populated
+            If stream=True: Generator yielding (frame_idx, masks_dict, state) tuples
+        """
+        if "video_source" not in state:
+            raise ValueError("Must call set_video before propagate_with_llm_crop")
+
+        if not state.get("frame_masks") and not state.get("seed_masks"):
+            raise ValueError("Must call add_prompt_on_frame or set_seed_masks first")
+
+        num_frames = state["num_frames"]
+        orig_h = state["orig_height"]
+        orig_w = state["orig_width"]
+
+        # Determine seed frames and initial masks
+        cond_frames = set(state.get("frame_masks", {}).keys()) | set(
+            state.get("seed_masks", {}).keys()
+        )
+        start_frame = min(cond_frames)
+
+        # Build initial per-object masks and bboxes from seed frame
+        initial_masks, initial_bboxes, obj_ids = self._extract_per_object_masks(
+            state, start_frame, orig_h, orig_w
+        )
+
+        # Processing order
+        if direction == "backward":
+            processing_order = list(range(start_frame - 1, -1, -1))
+        else:
+            processing_order = list(range(start_frame + 1, num_frames))
+
+        state["propagated_masks"] = {}
+
+        # Store seed frame results
+        seed_masks_tensor = torch.stack(
+            [initial_masks[oid] for oid in obj_ids]
+        )
+        seed_scores = torch.ones(len(obj_ids))
+        state["propagated_masks"][start_frame] = {
+            "obj_ids": list(obj_ids),
+            "masks": seed_masks_tensor.cpu(),
+            "scores": seed_scores,
+        }
+
+        def _propagate_with_crop_generator():
+            # Track per-object state across frames
+            prev_masks_per_obj = dict(initial_masks)  # {obj_id: mask_tensor}
+            prev_bboxes_per_obj = dict(initial_bboxes)  # {obj_id: (x1,y1,x2,y2)}
+            last_llm_crops = None  # {obj_id: (x1,y1,x2,y2)}
+            frames_since_llm = 0
+
+            # Get previous frame for first LLM call
+            prev_frame = self._get_frame(state, start_frame)
+
+            # Initialize a fresh tracker for crop-space tracking
+            # We re-initialize per frame since each crop is different
+            logger.debug(
+                f"Starting LLM-guided crop propagation: {len(processing_order)} frames, "
+                f"{len(obj_ids)} objects"
+            )
+
+            for frame_idx in tqdm(processing_order, desc="propagate with LLM crop"):
+                curr_frame = self._get_frame(state, frame_idx)
+                if curr_frame is None:
+                    logger.warning(f"Could not read frame {frame_idx}, skipping")
+                    continue
+
+                # Determine crop zones for this frame
+                need_llm = (
+                    frames_since_llm >= llm_every_n_frames or last_llm_crops is None
+                )
+
+                crop_zones = None
+                if need_llm:
+                    # Call LLM for crop zone prediction
+                    crop_zones = llm_advisor.predict_crop_zones(
+                        prev_frame=prev_frame,
+                        prev_masks=prev_masks_per_obj,
+                        prev_bboxes=prev_bboxes_per_obj,
+                        curr_frame=curr_frame,
+                        object_descriptions=object_descriptions,
+                    )
+                    if crop_zones is not None:
+                        last_llm_crops = crop_zones
+                        frames_since_llm = 0
+                    else:
+                        logger.debug(
+                            f"Frame {frame_idx}: LLM failed, using fallback crops"
+                        )
+                        frames_since_llm += 1
+                else:
+                    frames_since_llm += 1
+
+                # Build per-object crop zones (with fallback)
+                frame_crop_zones = {}
+                for obj_id in obj_ids:
+                    if crop_zones and obj_id in crop_zones:
+                        frame_crop_zones[obj_id] = crop_zones[obj_id]
+                    elif last_llm_crops and obj_id in last_llm_crops:
+                        # Use last known LLM crop
+                        frame_crop_zones[obj_id] = last_llm_crops[obj_id]
+                    elif obj_id in prev_bboxes_per_obj and prev_bboxes_per_obj[obj_id] is not None:
+                        # Fallback: expand previous bbox
+                        frame_crop_zones[obj_id] = llm_advisor.fallback_crop(
+                            prev_bboxes_per_obj[obj_id],
+                            orig_h,
+                            orig_w,
+                            padding=crop_padding * 2,  # extra padding for fallback
+                        )
+                    else:
+                        # No info at all: use full frame
+                        frame_crop_zones[obj_id] = (0, 0, orig_w, orig_h)
+
+                # Process each object: crop, track, map back
+                frame_masks_full = {}
+                frame_scores = {}
+
+                for obj_id in obj_ids:
+                    crop_zone = frame_crop_zones[obj_id]
+                    cx1, cy1, cx2, cy2 = crop_zone
+
+                    # Ensure minimum crop size
+                    crop_w = cx2 - cx1
+                    crop_h = cy2 - cy1
+                    if crop_w < 32 or crop_h < 32:
+                        # Too small, expand
+                        cx_center = (cx1 + cx2) // 2
+                        cy_center = (cy1 + cy2) // 2
+                        half = max(32, crop_w, crop_h)
+                        cx1 = max(0, cx_center - half)
+                        cy1 = max(0, cy_center - half)
+                        cx2 = min(orig_w, cx_center + half)
+                        cy2 = min(orig_h, cy_center + half)
+                        crop_zone = (cx1, cy1, cx2, cy2)
+
+                    # Crop current frame
+                    if isinstance(curr_frame, np.ndarray):
+                        cropped_frame = curr_frame[cy1:cy2, cx1:cx2].copy()
+                    elif isinstance(curr_frame, PIL.Image.Image):
+                        cropped_frame = np.array(curr_frame)[cy1:cy2, cx1:cx2].copy()
+                    else:
+                        cropped_frame = curr_frame[..., cy1:cy2, cx1:cx2].clone()
+
+                    # Also crop previous mask into crop space for re-initialization
+                    prev_mask = prev_masks_per_obj.get(obj_id)
+                    if prev_mask is not None:
+                        if isinstance(prev_mask, torch.Tensor):
+                            prev_mask_np = prev_mask.cpu().numpy()
+                        else:
+                            prev_mask_np = prev_mask
+                        prev_mask_np = prev_mask_np.squeeze()
+                        cropped_prev_mask = prev_mask_np[cy1:cy2, cx1:cx2]
+                    else:
+                        cropped_prev_mask = None
+
+                    # Run detection on cropped frame with mask guidance
+                    try:
+                        crop_state = self.set_image(cropped_frame)
+
+                        # Use text prompt if available
+                        text_prompt = state.get("text_prompt")
+                        if text_prompt:
+                            crop_state = self.set_text_prompt(text_prompt, crop_state)
+
+                        # Use mask guidance
+                        if cropped_prev_mask is not None and cropped_prev_mask.any():
+                            mask_tensor = torch.from_numpy(
+                                cropped_prev_mask.astype(np.float32)
+                            ).unsqueeze(0)
+                            crop_state = self.add_mask_prompt(mask_tensor, crop_state)
+
+                        crop_masks = crop_state.get("masks")
+                        crop_scores = crop_state.get("scores")
+
+                        if crop_masks is not None and len(crop_masks) > 0:
+                            # Take best mask
+                            best_idx = 0
+                            if crop_scores is not None and len(crop_scores) > 0:
+                                best_idx = crop_scores.argmax().item()
+
+                            best_mask_crop = crop_masks[best_idx]
+                            best_score = (
+                                crop_scores[best_idx].item()
+                                if crop_scores is not None
+                                else 1.0
+                            )
+
+                            # Map mask back to full frame
+                            full_mask = self._paste_mask_back(
+                                best_mask_crop.unsqueeze(0),
+                                crop_zone,
+                                (orig_h, orig_w),
+                            ).squeeze(0)
+
+                            frame_masks_full[obj_id] = full_mask
+                            frame_scores[obj_id] = best_score
+                        else:
+                            # Detection failed in crop, keep previous mask
+                            logger.debug(
+                                f"Frame {frame_idx}, obj {obj_id}: "
+                                "no mask from cropped detection, keeping previous"
+                            )
+                            if prev_mask is not None:
+                                frame_masks_full[obj_id] = (
+                                    prev_mask
+                                    if isinstance(prev_mask, torch.Tensor)
+                                    else torch.from_numpy(prev_mask)
+                                )
+                                frame_scores[obj_id] = 0.5
+                    except Exception as e:
+                        logger.warning(
+                            f"Frame {frame_idx}, obj {obj_id}: "
+                            f"detection in crop failed: {e}"
+                        )
+                        if prev_mask is not None:
+                            frame_masks_full[obj_id] = (
+                                prev_mask
+                                if isinstance(prev_mask, torch.Tensor)
+                                else torch.from_numpy(prev_mask)
+                            )
+                            frame_scores[obj_id] = 0.3
+
+                # Assemble frame results
+                masks_list = []
+                scores_list = []
+                for obj_id in obj_ids:
+                    if obj_id in frame_masks_full:
+                        masks_list.append(frame_masks_full[obj_id])
+                        scores_list.append(frame_scores.get(obj_id, 1.0))
+                    else:
+                        masks_list.append(
+                            torch.zeros(orig_h, orig_w, dtype=torch.bool)
+                        )
+                        scores_list.append(0.0)
+
+                masks_tensor = torch.stack(masks_list).cpu()
+                scores_tensor = torch.tensor(scores_list)
+
+                masks_dict = {
+                    "obj_ids": list(obj_ids),
+                    "masks": (masks_tensor > 0.5),
+                    "scores": scores_tensor,
+                }
+                state["propagated_masks"][frame_idx] = masks_dict
+
+                # Update per-object state for next frame
+                from sam3.agent.helpers.frame_renderer import mask_to_bbox
+
+                for i, obj_id in enumerate(obj_ids):
+                    if obj_id in frame_masks_full:
+                        prev_masks_per_obj[obj_id] = frame_masks_full[obj_id]
+                        bbox = mask_to_bbox(frame_masks_full[obj_id])
+                        prev_bboxes_per_obj[obj_id] = bbox
+                    # else: keep previous
+
+                prev_frame = curr_frame
+
+                yield frame_idx, masks_dict, state
+
+            state["propagation_done"] = True
+
+        if stream:
+            return _propagate_with_crop_generator()
+        else:
+            for _ in _propagate_with_crop_generator():
+                pass
+            return state
+
+    def _extract_per_object_masks(self, state, frame_idx, orig_h, orig_w):
+        """
+        Extract per-object masks and bboxes from state for a given frame.
+
+        Returns:
+            masks: dict {obj_id: mask_tensor [H, W]}
+            bboxes: dict {obj_id: (x1, y1, x2, y2) or None}
+            obj_ids: list of obj_ids
+        """
+        from sam3.agent.helpers.frame_renderer import mask_to_bbox
+
+        masks = {}
+        bboxes = {}
+
+        if frame_idx in state.get("seed_masks", {}):
+            for obj_id, mask in state["seed_masks"][frame_idx].items():
+                if isinstance(mask, torch.Tensor):
+                    m = mask.squeeze()
+                else:
+                    m = torch.from_numpy(np.squeeze(mask))
+                masks[obj_id] = m
+                bboxes[obj_id] = mask_to_bbox(m)
+        elif frame_idx in state.get("frame_masks", {}):
+            data = state["frame_masks"][frame_idx]
+            all_masks = data["masks"]
+            for obj_id in range(len(all_masks)):
+                m = all_masks[obj_id].squeeze()
+                if isinstance(m, np.ndarray):
+                    m = torch.from_numpy(m)
+                masks[obj_id] = m
+                bboxes[obj_id] = mask_to_bbox(m)
+        elif frame_idx in state.get("propagated_masks", {}):
+            data = state["propagated_masks"][frame_idx]
+            for i, obj_id in enumerate(data["obj_ids"]):
+                m = data["masks"][i].squeeze()
+                if isinstance(m, np.ndarray):
+                    m = torch.from_numpy(m)
+                masks[obj_id] = m
+                bboxes[obj_id] = mask_to_bbox(m)
+
+        obj_ids = sorted(masks.keys())
+        return masks, bboxes, obj_ids
+
     def clear_text_cache(self):
         """Clear text embedding cache."""
         self._text_cache.clear()
