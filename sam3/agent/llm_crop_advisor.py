@@ -108,9 +108,9 @@ class LLMCropAdvisor:
             server_url: OpenAI-compatible API endpoint URL
             model: Model name/ID for the API
             api_key: Optional API key
-            crop_padding: Default padding factor around predicted crops. Used only
-                by :meth:`fallback_crop`; Re-grounding returns raw located boxes
-                and :mod:`sam3.zoom_anchor` applies the padding.
+            crop_padding: Retained for callers that still construct the advisor
+                with it. Nothing here pads anything: Re-grounding returns raw
+                located boxes and :mod:`sam3.zoom_anchor` owns the padding.
             max_tokens: Max tokens for one Object's response
             request_timeout: Seconds one Object's request may take, and the budget
                 for a whole frame's batch of them
@@ -364,46 +364,6 @@ class LLMCropAdvisor:
             pass
         except OSError as exc:
             logger.warning("could not delete temporary image %s: %s", path, exc)
-
-    def fallback_crop(self, prev_bbox, orig_h, orig_w, padding=None):
-        """
-        Fallback: expand previous bbox with padding when LLM fails.
-
-        Superseded by :func:`sam3.zoom_anchor.resolve_zoom_anchor`, which owns the
-        padding and the rest of the window geometry. Re-grounding no longer pads
-        anything. Kept only for the one remaining caller in
-        ``sam3_unified_processor.propagate_with_llm_crop``, which moves to the
-        resolver separately.
-
-        Args:
-            prev_bbox: (x1, y1, x2, y2) in pixel coords from previous frame
-            orig_h: Original image height
-            orig_w: Original image width
-            padding: Padding factor (defaults to self.crop_padding)
-
-        Returns:
-            (x1, y1, x2, y2) padded crop zone in pixel coords
-        """
-        if padding is None:
-            padding = self.crop_padding
-
-        x1, y1, x2, y2 = prev_bbox
-        return self._apply_padding(x1, y1, x2, y2, orig_h, orig_w, padding)
-
-    @staticmethod
-    def _apply_padding(x1, y1, x2, y2, orig_h, orig_w, padding):
-        """Apply padding to a bounding box and clamp to image bounds."""
-        box_w = x2 - x1
-        box_h = y2 - y1
-        pad_w = int(box_w * padding)
-        pad_h = int(box_h * padding)
-
-        x1 = max(0, x1 - pad_w)
-        y1 = max(0, y1 - pad_h)
-        x2 = min(orig_w, x2 + pad_w)
-        y2 = min(orig_h, y2 + pad_h)
-
-        return (x1, y1, x2, y2)
 
     @staticmethod
     def _save_temp_image(pil_image):

@@ -1803,14 +1803,23 @@ class Sam3UnifiedProcessor:
                     previous_mask_area=int((initial_masks[obj_id] > 0.5).sum().item()),
                 )
 
-        def _request_re_grounding(prev_frame, prev_masks, prev_bboxes, curr_frame):
-            """Runs on the background worker; no torch, no shared mutable state."""
-            return llm_advisor.predict_crop_zones(
+        def _request_re_grounding(
+            prev_frame, object_ids_to_ask, prev_masks, prev_bboxes, curr_frame
+        ):
+            """Runs on the background worker; no torch, no shared mutable state.
+
+            One request per Object is issued inside ``re_ground_objects``, which
+            also owns the timeout and the concurrency. An Object with no mask on
+            the previous frame is still asked about as long as it has an Object
+            Hint -- that is the case Re-grounding exists for.
+            """
+            return llm_advisor.re_ground_objects(
                 prev_frame=prev_frame,
+                curr_frame=curr_frame,
+                object_ids=object_ids_to_ask,
                 prev_masks=prev_masks,
                 prev_bboxes=prev_bboxes,
-                curr_frame=curr_frame,
-                object_descriptions=object_descriptions,
+                object_hints=object_descriptions,
             )
 
         def _run_pass(pass_, executor):
@@ -1848,21 +1857,27 @@ class Sam3UnifiedProcessor:
                 # Never blocks: an unfinished request is simply not ready yet.
                 re_grounding = None
                 if pending is not None and pending.done():
-                    raw = pending.result()
+                    # Any exception raised on the worker surfaces here rather
+                    # than being swallowed; re_ground_objects itself only raises
+                    # when it was asked something it cannot answer at all.
+                    result = pending.result()
                     pending = None
-                    if raw is None:
-                        logger.warning(
-                            f"[ZOOM] frame {frame_idx}: the Re-grounding request "
-                            f"made on frame {pending_frame} failed; windows follow "
-                            "each Object's own mask until the next tick"
+                    if result.every_request_failed:
+                        # Not a scene the model could not read -- a provider that
+                        # answered nothing at all. Say so in the operator's words
+                        # instead of letting it look like a run with no Objects.
+                        logger.error(
+                            f"[ZOOM] frame {frame_idx}: every Re-grounding request "
+                            f"made on frame {pending_frame} failed "
+                            f"({result.failures}); windows follow each Object's own "
+                            "mask until a later tick succeeds"
                         )
-                    else:
-                        re_grounding, rejected = partition_re_grounding(raw)
-                        if rejected:
-                            logger.warning(
-                                f"[ZOOM] frame {frame_idx}: discarded malformed "
-                                f"Re-grounding boxes {rejected}"
-                            )
+                    re_grounding, rejected = partition_re_grounding(result)
+                    if rejected:
+                        logger.warning(
+                            f"[ZOOM] frame {frame_idx}: discarded malformed "
+                            f"Re-grounding boxes {rejected}"
+                        )
 
                 # A tick submits a request and moves on. The cadence is a function
                 # of the frame index, so a skipped or failed request waits for the
@@ -1875,26 +1890,25 @@ class Sam3UnifiedProcessor:
                             "flight"
                         )
                     else:
+                        # Every active Object is asked about, including the ones
+                        # with no mask left: an Object the chain lost is exactly
+                        # what its Object Hint is for. re_ground_objects decides
+                        # per Object whether there is anything to ask with, and
+                        # reports NOT_ASKED for the ones there is not.
                         request_masks = {
                             obj_id: prev_masks_per_obj[obj_id]
                             for obj_id in ledger.active_object_ids
                             if prev_masks_per_obj.get(obj_id) is not None
                         }
-                        if request_masks:
-                            pending_frame = frame_idx
-                            pending = executor.submit(
-                                _request_re_grounding,
-                                prev_frame,
-                                request_masks,
-                                ledger.previous_bboxes(),
-                                curr_frame,
-                            )
-                        else:
-                            logger.warning(
-                                f"[ZOOM] frame {frame_idx}: Re-grounding tick "
-                                "skipped, no active object has a mask to show the "
-                                "vision model"
-                            )
+                        pending_frame = frame_idx
+                        pending = executor.submit(
+                            _request_re_grounding,
+                            prev_frame,
+                            ledger.active_object_ids,
+                            request_masks,
+                            ledger.previous_bboxes(),
+                            curr_frame,
+                        )
 
                 anchors = ledger.resolve(re_grounding)
 
