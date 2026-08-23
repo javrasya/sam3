@@ -125,6 +125,104 @@ def send_generate_request(
         return None
 
 
+# DISCERN FORK LOCAL ADDITION -- not part of upstream SAM3 (see Discern ADR 0002).
+def send_vision_request(
+    messages,
+    server_url,
+    model,
+    api_key=None,
+    max_tokens=1024,
+    timeout=20.0,
+    max_retries=0,
+):
+    """Send one vision request and either return its text or raise.
+
+    A sibling of :func:`send_generate_request` for Re-grounding, which needs three
+    things that one deliberately does not do (its other callers, the agent loop,
+    rely on the ``None``):
+
+    * **It raises.** Every failure there -- auth, HTTP, timeout, an empty message --
+      collapses to ``None``, which the crop path could not tell apart from "the
+      model found no object". Here the exception carries the provider's own words
+      to the caller, which turns them into a visible per-Object failure.
+    * **It has an explicit timeout.** The openai SDK otherwise applies its own
+      default of 600s per attempt, three attempts.
+    * **It does not retry.** Re-grounding runs on a tick; a request that failed
+      waits for the next tick instead of spending the frame's budget again.
+
+    Args:
+        messages: OpenAI-style messages. A ``{"type": "image", "image": <path>}``
+            part is read from disk and inlined as base64, as in
+            :func:`send_generate_request`.
+        server_url: OpenAI-compatible base URL.
+        model: Model id.
+        api_key: Provider key.
+        max_tokens: Sent as ``max_completion_tokens``.
+        timeout: Seconds for the whole request.
+        max_retries: Retries the SDK may make. Zero, by intent.
+
+    Returns:
+        str: The message content.
+
+    Raises:
+        ValueError: An image could not be read, or the provider answered with no
+            usable content.
+        Exception: Whatever the openai client raises, unchanged.
+    """
+    processed_messages = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            processed_messages.append(message)
+            continue
+
+        processed_content = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "image":
+                image_path = c["image"].replace("?", "%3F")
+                base64_image, mime_type = get_image_base64_and_mime(image_path)
+                if base64_image is None:
+                    raise ValueError(f"could not read request image: {image_path}")
+                processed_content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{base64_image}",
+                            "detail": "high",
+                        },
+                    }
+                )
+            else:
+                processed_content.append(c)
+
+        processed_message = message.copy()
+        processed_message["content"] = processed_content
+        processed_messages.append(processed_message)
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=server_url,
+        timeout=timeout,
+        max_retries=max_retries,
+    )
+    response = client.chat.completions.create(
+        model=model,
+        messages=processed_messages,
+        max_completion_tokens=max_tokens,
+        n=1,
+    )
+
+    if not response.choices:
+        raise ValueError(f"provider returned no choices: {response}")
+    content = response.choices[0].message.content
+    if content is None:
+        raise ValueError(
+            "provider returned an empty message -- a reasoning model can spend the "
+            f"whole max_completion_tokens budget ({max_tokens}) before emitting any"
+        )
+    return content
+
+
 def send_direct_request(
     llm: Any,
     messages: list[dict[str, Any]],
