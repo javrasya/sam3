@@ -38,6 +38,7 @@ from sam3.model.geometry_encoders import Prompt
 # bookkeeping around it are local to javrasya/sam3 (see Discern ADR 0002).
 from sam3.zoom_anchor import (
     FORWARD,
+    choose_object_match,
     ObjectZoomState,
     ZoomAnchorConfig,
     plan_processing_passes,
@@ -2024,43 +2025,70 @@ class Sam3UnifiedProcessor:
                                 "with no scores; refusing to invent a confidence "
                                 "for them"
                             )
-                        best_idx = crop_scores.argmax().item()
-                        best_score = crop_scores[best_idx].item()
-
-                        full_mask = self._paste_mask_back(
-                            crop_masks[best_idx].unsqueeze(0),
-                            window.as_tuple(),
-                            (orig_h, orig_w),
-                        ).squeeze(0)
-                        binary = (full_mask > 0.5).cpu()
-
-                        # DISCERN FORK LOCAL ADDITION -- geometry read-out.
-                        # A Zoom Window is only useful if the mask that comes out
-                        # of it is the size the Object is. Reporting the window,
-                        # what the crop returned, and what survived the paste
-                        # separates "the window was wrong" from "SAM3 found
-                        # something tiny inside a correct window" from "the paste
-                        # lost it" -- which the anchor source alone cannot.
-                        crop_binary = crop_masks[best_idx] > 0.5
-                        logger.info(
-                            f"[ZOOM] frame {frame_idx} obj {obj_id}: "
-                            f"window={window.as_tuple()} "
-                            f"{window.width}x{window.height} "
-                            f"crop={cropped_frame.size if hasattr(cropped_frame, 'size') else 'n/a'} "
-                            f"detections={len(crop_masks)} "
-                            f"chosen={best_idx} score={best_score:.3f} "
-                            f"crop_px={int(crop_binary.sum().item())} "
-                            f"mask_shape={tuple(crop_masks[best_idx].shape)} "
-                            f"pasted_px={int(binary.sum().item())}"
-                        )
-                        bbox = mask_to_bbox(binary)
-                        if bbox is not None:
-                            observation = MaskObservation(
-                                bbox=self._exclusive_bbox(bbox),
-                                area=int(binary.sum().item()),
+                        # Which of these detections is this Object? A Zoom
+                        # Window is sized from its Object plus padding and held
+                        # above a floor, so when Objects are small and close --
+                        # dummies 40 to 85 pixels apart in 240 pixel windows --
+                        # every window holds every Object. Taking the best score
+                        # then takes whichever Object the model preferred on this
+                        # frame, and two Objects merge within a frame or two.
+                        expected = self._crop_space_bbox(cropped_prev_mask)
+                        candidate_boxes = self._candidate_boxes(crop_state)
+                        matched = choose_object_match(candidate_boxes, expected)
+                        if matched is None and expected is not None:
+                            # Nothing in the window overlaps where this Object
+                            # was. It is not here on this frame; saying so is the
+                            # project's rule, and the absence streak is what acts
+                            # on it.
+                            logger.info(
+                                f"[ZOOM] frame {frame_idx} obj {obj_id}: none of "
+                                f"{len(candidate_boxes)} detections overlap the "
+                                "Object's own previous box, reported absent"
                             )
-                            frame_masks_full[obj_id] = binary
-                            frame_scores[obj_id] = best_score
+                            crop_masks = None
+                        if crop_masks is not None:
+                            if matched is None:
+                                # No previous box to match on -- a reacquired
+                                # Object's first frame. Score is all there is.
+                                best_idx = crop_scores.argmax().item()
+                            else:
+                                best_idx = matched
+                            best_score = crop_scores[best_idx].item()
+
+                            full_mask = self._paste_mask_back(
+                                crop_masks[best_idx].unsqueeze(0),
+                                window.as_tuple(),
+                                (orig_h, orig_w),
+                            ).squeeze(0)
+                            binary = (full_mask > 0.5).cpu()
+
+                            # DISCERN FORK LOCAL ADDITION -- geometry read-out.
+                            # A Zoom Window is only useful if the mask that comes out
+                            # of it is the size the Object is. Reporting the window,
+                            # what the crop returned, and what survived the paste
+                            # separates "the window was wrong" from "SAM3 found
+                            # something tiny inside a correct window" from "the paste
+                            # lost it" -- which the anchor source alone cannot.
+                            crop_binary = crop_masks[best_idx] > 0.5
+                            logger.info(
+                                f"[ZOOM] frame {frame_idx} obj {obj_id}: "
+                                f"window={window.as_tuple()} "
+                                f"{window.width}x{window.height} "
+                                f"crop={cropped_frame.size if hasattr(cropped_frame, 'size') else 'n/a'} "
+                                f"detections={len(crop_masks)} "
+                                f"chosen={best_idx} score={best_score:.3f} "
+                                f"crop_px={int(crop_binary.sum().item())} "
+                                f"mask_shape={tuple(crop_masks[best_idx].shape)} "
+                                f"pasted_px={int(binary.sum().item())}"
+                            )
+                            bbox = mask_to_bbox(binary)
+                            if bbox is not None:
+                                observation = MaskObservation(
+                                    bbox=self._exclusive_bbox(bbox),
+                                    area=int(binary.sum().item()),
+                                )
+                                frame_masks_full[obj_id] = binary
+                                frame_scores[obj_id] = best_score
 
                     if observation is None:
                         logger.debug(
@@ -2191,6 +2219,29 @@ class Sam3UnifiedProcessor:
         if isinstance(frame, np.ndarray):
             return PIL.Image.fromarray(frame[y1:y2, x1:x2].astype(np.uint8))
         return frame[..., y1:y2, x1:x2].clone()
+
+    # DISCERN FORK LOCAL ADDITION -- not part of upstream SAM3 (see Discern ADR 0002).
+    @staticmethod
+    def _crop_space_bbox(cropped_mask):
+        """Exclusive box of a window-space mask, or None when it is empty."""
+        if cropped_mask is None:
+            return None
+        rows = np.any(cropped_mask, axis=1)
+        cols = np.any(cropped_mask, axis=0)
+        if not rows.any() or not cols.any():
+            return None
+        y1, y2 = np.where(rows)[0][[0, -1]]
+        x1, x2 = np.where(cols)[0][[0, -1]]
+        return (int(x1), int(y1), int(x2) + 1, int(y2) + 1)
+
+    # DISCERN FORK LOCAL ADDITION -- not part of upstream SAM3 (see Discern ADR 0002).
+    @staticmethod
+    def _candidate_boxes(crop_state):
+        """This crop's detections as plain exclusive boxes, in crop space."""
+        boxes = crop_state.get("boxes")
+        if boxes is None or len(boxes) == 0:
+            return []
+        return [tuple(float(v) for v in box.tolist()) for box in boxes]
 
     # DISCERN FORK LOCAL ADDITION
     @staticmethod

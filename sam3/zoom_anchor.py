@@ -44,7 +44,7 @@ Conventions
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "BBox",
@@ -564,3 +564,50 @@ def advance_object_state(
             else state.stale_re_grounding
         ),
     )
+
+
+# DISCERN FORK LOCAL ADDITION -- not part of upstream SAM3 (see Discern ADR 0002).
+def box_iou(a: BBox, b: BBox) -> float:
+    """Intersection over union of two exclusive boxes."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    intersection = (ix2 - ix1) * (iy2 - iy1)
+    union = (
+        (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - intersection
+    )
+    return intersection / union if union > 0 else 0.0
+
+
+# DISCERN FORK LOCAL ADDITION -- not part of upstream SAM3 (see Discern ADR 0002).
+def choose_object_match(
+    candidates: Sequence[BBox],
+    expected: Optional[BBox],
+) -> Optional[int]:
+    """Which detection inside a Zoom Window is this Object -- or None.
+
+    A Zoom Window is sized from its Object plus padding, and a floor keeps it
+    from collapsing. When Objects are close together and small -- three dummies
+    40 to 85 pixels apart, framed by 240 pixel windows -- every window contains
+    every Object. Picking the highest-scoring detection then picks whichever
+    Object the model liked best on that frame, and two Objects converge onto one
+    within a frame or two, after which every later frame confirms the merge.
+
+    So the Object's own previous box decides, not the score. ``expected`` is that
+    box in the same space as ``candidates``, or None when the Object has no
+    previous box to compare against -- a caller with nothing to match on should
+    fall back to its own rule rather than pass a guess in here.
+
+    Returns None when no candidate overlaps ``expected`` at all. That is a real
+    answer: the Object is not in its window on this frame, and reporting it
+    absent is the project's rule, where returning the least-bad non-overlapping
+    box would put the Object somewhere it demonstrably is not.
+    """
+    if expected is None or not candidates:
+        return None
+    scored = [(box_iou(candidate, expected), index) for index, candidate in enumerate(candidates)]
+    best_iou, best_index = max(scored)
+    return best_index if best_iou > 0.0 else None
