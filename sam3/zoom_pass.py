@@ -24,7 +24,7 @@ Per-Object abandonment
     that abandoned the *entire* pass -- every Object, every frame -- as soon as one
     shared window grew large.
 Honest outcomes
-    Every (frame, Object) the pass looked at gets a :class:`MaskOutcome`. Only
+    Every (frame, Object) the pass looked at gets a :class:`MaskOutcomeRecord`. Only
     ``IMPROVED`` carries a score, and only ``IMPROVED`` may be emitted as a mask:
     a mask the pass never improved is left exactly as propagation produced it,
     rather than being re-encoded, re-emitted and scored ``1.0``.
@@ -32,8 +32,18 @@ Its own verdict
     :class:`ZoomPassReport` accumulates those outcomes and answers the question
     the caller has to relay to a person: did this pass improve anything at all?
 
-Vocabulary is Discern's glossary (see Discern ``CONTEXT.md``); "Zoom Pass" is
-spelled *refine/refinement* throughout Discern's code.
+Vocabulary is Discern's glossary (see Discern ``CONTEXT.md``). Nothing here is
+named *refinement*: the glossary reserves that word for the workflow state in
+which a person hand-corrects frames, and this pass is automated end to end.
+Discern's caller is still spelled ``Sam3Backend.refine_all_frames`` -- that is the
+legacy name this vocabulary replaces, and the mapping is recorded here so it stays
+findable rather than being carried into new type names.
+
+Nothing in either repository calls this module yet: Discern's Zoom Pass still runs
+the older shared-union-window code that ``refine_all_frames`` was written around,
+and moving it onto these decisions is a follow-up of its own (see the Zoom Pass
+backend hand-off note for spec javrasya/discern#91). Until then this module is
+exercised only by ``tests/test_zoom_pass.py``.
 
 Anchoring, and how it differs from propagation
 ----------------------------------------------
@@ -75,7 +85,7 @@ __all__ = [
     "ZoomPassStatus",
     "ObjectMaskGeometry",
     "ObjectZoomPlan",
-    "MaskRefinement",
+    "MaskOutcomeRecord",
     "ZoomPassReport",
     "is_zoom_beneficial",
     "plan_zoom_pass_frame",
@@ -89,19 +99,17 @@ class ZoomPassConfig:
 
     Args:
         anchor: Geometry settings, handed straight to the Zoom Anchor resolver.
-        max_window_frame_fraction: An Object whose Zoom Window spans at least this
-            fraction of the frame's shorter side is abandoned *for that frame*,
-            because cropping to it and resizing back gains no resolution. This is
-            the old global 90% rule, now scoped to one Object and measured against
-            a side rather than an area -- see :func:`is_zoom_beneficial`.
+            ``anchor.max_window_frame_fraction`` is the abandonment threshold: an
+            Object whose Zoom Window would reach that fraction of the frame's
+            shorter side is abandoned *for that frame*, because cropping to it and
+            resizing back gains no resolution. This is the old global 90% rule,
+            now scoped to one Object and measured against a side rather than an
+            area -- see :func:`is_zoom_beneficial`. It lives on the resolver's
+            config because the resolver applies the same rule on the propagation
+            path, and one rule spelled in two places is how the two drift apart.
     """
 
     anchor: ZoomAnchorConfig = DEFAULT_ZOOM_ANCHOR_CONFIG
-    max_window_frame_fraction: float = 0.9
-
-    def __post_init__(self):
-        if not 0 < self.max_window_frame_fraction <= 1:
-            raise ValueError("max_window_frame_fraction must be in (0, 1]")
 
 
 DEFAULT_ZOOM_PASS_CONFIG = ZoomPassConfig()
@@ -181,7 +189,7 @@ class ObjectZoomPlan:
 
 # DISCERN FORK LOCAL ADDITION
 @dataclass(frozen=True)
-class MaskRefinement:
+class MaskOutcomeRecord:
     """One (frame, Object) result, scored honestly.
 
     ``score`` is the detection score of the mask the pass produced, and exists
@@ -218,26 +226,28 @@ class MaskRefinement:
 
 # DISCERN FORK LOCAL ADDITION
 class ZoomPassReport:
-    """Accumulates :class:`MaskRefinement` records and delivers the pass's verdict.
+    """Accumulates :class:`MaskOutcomeRecord` records and delivers the pass's verdict.
 
     Mutable on purpose: the Zoom Pass is a generator streaming frame by frame, and
     the verdict is only known once it has finished.
     """
 
     def __init__(self):
-        self._refinements: list = []
+        self._outcomes: list = []
 
-    def record(self, refinement: MaskRefinement) -> None:
-        if not isinstance(refinement, MaskRefinement):
-            raise TypeError(f"expected MaskRefinement, got {type(refinement).__name__}")
-        self._refinements.append(refinement)
+    def record(self, outcome: MaskOutcomeRecord) -> None:
+        if not isinstance(outcome, MaskOutcomeRecord):
+            raise TypeError(
+                f"expected MaskOutcomeRecord, got {type(outcome).__name__}"
+            )
+        self._outcomes.append(outcome)
 
     @property
-    def refinements(self) -> Tuple[MaskRefinement, ...]:
-        return tuple(self._refinements)
+    def outcomes(self) -> Tuple[MaskOutcomeRecord, ...]:
+        return tuple(self._outcomes)
 
     def count(self, outcome: MaskOutcome) -> int:
-        return sum(1 for r in self._refinements if r.outcome is outcome)
+        return sum(1 for r in self._outcomes if r.outcome is outcome)
 
     @property
     def improved_count(self) -> int:
@@ -253,15 +263,15 @@ class ZoomPassReport:
 
     @property
     def total_count(self) -> int:
-        return len(self._refinements)
+        return len(self._outcomes)
 
     @property
     def object_ids(self) -> Tuple[int, ...]:
-        return tuple(sorted({r.object_id for r in self._refinements}))
+        return tuple(sorted({r.object_id for r in self._outcomes}))
 
     @property
     def frames_improved(self) -> Tuple[int, ...]:
-        return tuple(sorted({r.frame_index for r in self._refinements if r.emits_mask}))
+        return tuple(sorted({r.frame_index for r in self._outcomes if r.emits_mask}))
 
     @property
     def anchor_source_counts(self) -> Dict[ZoomAnchorSource, int]:
@@ -271,7 +281,7 @@ class ZoomPassReport:
         so is the whole reason the source is recorded.
         """
         counts: Dict[ZoomAnchorSource, int] = {}
-        for r in self._refinements:
+        for r in self._outcomes:
             counts[r.anchor_source] = counts.get(r.anchor_source, 0) + 1
         return counts
 
@@ -282,7 +292,7 @@ class ZoomPassReport:
         never improved on any frame" are both true at once and both worth seeing.
         """
         by_object: Dict[int, Dict[MaskOutcome, int]] = {}
-        for r in self._refinements:
+        for r in self._outcomes:
             counts = by_object.setdefault(r.object_id, {})
             counts[r.outcome] = counts.get(r.outcome, 0) + 1
         return by_object
@@ -349,19 +359,24 @@ def is_zoom_beneficial(
 
     Per Object, per frame. The old rule asked the same question of one window
     shared by everybody and, on a No, abandoned the whole pass -- so a single
-    sprawling Object silently cost every other Object its refinement.
+    sprawling Object silently cost every other Object its improved mask.
 
     The comparison is the window's longest side against the frame's shortest
-    side, not the old area-against-area. Zoom Windows are square and the resolver
-    caps them at the frame's shorter side, so on a 16:9 frame a window can never
-    exceed 56% of the frame *area* however large the Object is -- an area test
-    would therefore never fire, which is a guard that quietly does not exist.
+    side, not the old area-against-area: Zoom Windows are square, so on a 16:9
+    frame a window can never exceed 56% of the frame *area* however large the
+    Object is -- an area test would never fire, which is a guard that quietly does
+    not exist.
+
+    The resolver applies the same threshold, so a window it hands back over the
+    line is already the whole frame; this stays a predicate on the window rather
+    than a reading of the anchor source, so the Zoom Pass's own decision is
+    checkable against any window a caller holds.
     """
     if frame_width < 1 or frame_height < 1:
         raise ValueError(f"frame must be non-empty, got {frame_width}x{frame_height}")
     window_side = max(window.width, window.height)
     frame_side = min(frame_width, frame_height)
-    return window_side < frame_side * config.max_window_frame_fraction
+    return window_side < frame_side * config.anchor.max_window_frame_fraction
 
 
 def _plural(count: int, noun: str) -> str:
@@ -434,7 +449,7 @@ def plan_zoom_pass_frame(
                 anchor.window, frame_width, frame_height, config
             ),
             next_state=advance_object_state(
-                state, geometry.bbox, geometry.area, anchor.window
+                state, geometry.bbox, geometry.area, anchor
             ),
         )
     return plans

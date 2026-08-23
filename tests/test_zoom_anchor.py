@@ -20,6 +20,7 @@ from sam3.zoom_anchor import (
     advance_object_state,
     plan_processing_order,
     plan_processing_passes,
+    re_grounding_is_fresh,
     resolve_zoom_anchor,
     resolve_zoom_anchors,
     should_re_ground,
@@ -141,6 +142,33 @@ def test_every_interval_produces_gaps_of_exactly_that_many_frames(interval):
 def test_the_seed_frame_is_never_a_tick_because_it_is_never_processed():
     with pytest.raises(ValueError):
         should_re_ground(10, 10, DEFAULT_ZOOM_ANCHOR_CONFIG)
+
+
+# --------------------------------------------------------------------------
+# How old an answer may be -- requests are never waited on
+# --------------------------------------------------------------------------
+
+
+def test_an_answer_about_the_frame_just_processed_is_still_fresh():
+    assert re_grounding_is_fresh(described_frame=10, frame_index=11)
+
+
+def test_an_answer_about_a_frame_the_pass_has_left_behind_is_not_fresh():
+    """A vision model slower than the frame rate answers about the past."""
+    assert not re_grounding_is_fresh(described_frame=11, frame_index=26)
+
+
+def test_freshness_is_measured_in_frames_in_either_direction():
+    """A backward pass counts down, and lateness is lateness."""
+    assert re_grounding_is_fresh(described_frame=20, frame_index=19)
+    assert not re_grounding_is_fresh(described_frame=20, frame_index=14)
+
+
+def test_how_late_an_answer_may_be_is_configurable():
+    patient = ZoomAnchorConfig(max_re_grounding_age=5)
+
+    assert re_grounding_is_fresh(11, 16, patient)
+    assert not re_grounding_is_fresh(11, 17, patient)
 
 
 # --------------------------------------------------------------------------
@@ -274,9 +302,8 @@ def test_a_re_grounding_result_for_one_object_does_not_move_another():
         square_at(960, 540, 300),
         square_at(10, 10, 40),
         square_at(1900, 1060, 40),
-        (0, 0, 1900, 1000),
-        (100, 100, 900, 200),
-        (100, 100, 200, 900),
+        (100, 100, 500, 200),
+        (100, 100, 200, 500),
     ],
 )
 def test_every_bbox_derived_window_is_square_and_inside_the_frame(bbox):
@@ -297,12 +324,35 @@ def test_at_a_frame_edge_the_window_slides_inward_rather_than_losing_its_shape()
     assert corner.as_tuple() == (0, 0, FLOOR, FLOOR)
 
 
-def test_a_window_wider_than_the_frame_is_capped_to_the_largest_square_that_fits():
-    window = resolve(ObjectZoomState(previous_bbox=(0, 0, 1900, 1000))).window
+def test_an_object_too_big_to_zoom_gets_the_whole_frame_rather_than_a_truncated_one():
+    """Cropping to the largest square that fits would cut this Object in half."""
+    anchor = resolve(ObjectZoomState(previous_bbox=(100, 100, 1800, 1000)))
 
-    assert window.is_square
-    assert window.width == min(WIDTH, HEIGHT)
-    assert window.y1 == 0 and window.y2 == HEIGHT
+    assert anchor.window.as_tuple() == (0, 0, WIDTH, HEIGHT)
+    assert anchor.source is ZoomAnchorSource.FULL_FRAME
+
+
+def test_a_big_object_is_never_framed_so_that_part_of_its_mask_is_outside_the_window():
+    """The chain re-anchors on what the window kept, so a truncation is permanent."""
+    state = ObjectZoomState(previous_bbox=(100, 100, 1800, 1000))
+
+    for _ in range(4):
+        anchor = resolve(state)
+        x1, y1, x2, y2 = state.previous_bbox
+        assert anchor.window.x1 <= x1 and anchor.window.x2 >= x2
+        assert anchor.window.y1 <= y1 and anchor.window.y2 >= y2
+        state = advance_object_state(state, state.previous_bbox, 500_000, anchor)
+
+
+def test_the_object_size_at_which_zoom_stops_being_worth_it_is_configurable():
+    bbox = square_at(960, 540, 300)  # asks for a 600px window on a 1080px side
+    strict = ZoomAnchorConfig(max_window_frame_fraction=0.5)
+
+    assert resolve(ObjectZoomState(previous_bbox=bbox)).window.width == 600
+    assert (
+        resolve(ObjectZoomState(previous_bbox=bbox), config=strict).source
+        is ZoomAnchorSource.FULL_FRAME
+    )
 
 
 def test_the_full_frame_fallback_is_the_whole_frame_and_says_so():
@@ -321,7 +371,7 @@ def test_the_full_frame_fallback_is_the_whole_frame_and_says_so():
 def test_zoom_lock_keeps_apparent_size_constant_as_an_object_approaches():
     """Window size tracks mask size, so the Object fills the same share of SAM3's input."""
     ratios = []
-    for side in (200, 300, 400, 500):
+    for side in (100, 200, 300, 400):
         window = resolve(
             ObjectZoomState(previous_bbox=square_at(960, 540, side))
         ).window
@@ -332,17 +382,17 @@ def test_zoom_lock_keeps_apparent_size_constant_as_an_object_approaches():
 
 
 def test_a_fixed_size_window_is_not_what_zoom_lock_produces():
-    near = resolve(ObjectZoomState(previous_bbox=square_at(960, 540, 500))).window
-    far = resolve(ObjectZoomState(previous_bbox=square_at(960, 540, 250))).window
+    near = resolve(ObjectZoomState(previous_bbox=square_at(960, 540, 400))).window
+    far = resolve(ObjectZoomState(previous_bbox=square_at(960, 540, 200))).window
 
     assert near.width == 2 * far.width
 
 
 def test_window_size_follows_the_longest_side_of_a_lopsided_mask():
-    tall = resolve(ObjectZoomState(previous_bbox=(900, 300, 1000, 700))).window
-    wide = resolve(ObjectZoomState(previous_bbox=(400, 500, 800, 600))).window
+    tall = resolve(ObjectZoomState(previous_bbox=(900, 300, 1000, 600))).window
+    wide = resolve(ObjectZoomState(previous_bbox=(400, 500, 700, 600))).window
 
-    assert tall.width == wide.width == 400 * 2
+    assert tall.width == wide.width == 300 * 2
 
 
 # --------------------------------------------------------------------------
@@ -445,9 +495,9 @@ def test_the_window_survives_a_long_run_of_empty_masks_without_shrinking_away():
     )
     sizes = []
     for _ in range(30):
-        window = resolve(state).window
-        sizes.append(window.width)
-        state = advance_object_state(state, square_at(960, 540, 4), 16, window)
+        anchor = resolve(state)
+        sizes.append(anchor.window.width)
+        state = advance_object_state(state, square_at(960, 540, 4), 16, anchor)
 
     assert min(sizes) >= FLOOR
     assert all(abs(b - a) <= a * 0.15 + 1 for a, b in zip(sizes, sizes[1:]))
@@ -462,8 +512,8 @@ def test_a_successful_re_grounding_becomes_the_stale_anchor_for_later_frames():
     state = ObjectZoomState(previous_bbox=square_at(300, 300, 100))
     fresh = square_at(1200, 600, 100)
 
-    window = resolve(state, fresh=fresh).window
-    state = advance_object_state(state, None, 0, window, fresh_re_grounding=fresh)
+    anchor = resolve(state, fresh=fresh)
+    state = advance_object_state(state, None, 0, anchor, fresh_re_grounding=fresh)
 
     anchor = resolve(state)
     assert anchor.source is ZoomAnchorSource.STALE
@@ -473,7 +523,7 @@ def test_a_successful_re_grounding_becomes_the_stale_anchor_for_later_frames():
 def test_an_absent_object_does_not_keep_pointing_at_a_mask_that_is_gone():
     state = ObjectZoomState(previous_bbox=square_at(300, 300, 100))
 
-    state = advance_object_state(state, None, 0, resolve(state).window)
+    state = advance_object_state(state, None, 0, resolve(state))
 
     assert resolve(state).source is ZoomAnchorSource.FULL_FRAME
 
@@ -481,10 +531,26 @@ def test_an_absent_object_does_not_keep_pointing_at_a_mask_that_is_gone():
 def test_the_full_frame_fallback_does_not_reset_the_rate_limit_to_the_whole_frame():
     state = ObjectZoomState(previous_window_size=400)
 
-    full_frame = resolve(state).window
+    full_frame = resolve(state)
     state = advance_object_state(state, square_at(960, 540, 10), 100, full_frame)
 
     assert resolve(state, config=RATE_LIMIT_ONLY).window.width == 340
+
+
+def test_the_full_frame_fallback_is_recognised_on_a_square_video_too():
+    """A 1:1 export makes the whole frame square, which shape alone cannot tell."""
+    state = ObjectZoomState(previous_window_size=400)
+
+    full_frame = resolve_zoom_anchor(state, None, 1024, 1024)
+    assert full_frame.window.as_tuple() == (0, 0, 1024, 1024)
+
+    state = advance_object_state(state, square_at(500, 500, 10), 100, full_frame)
+
+    assert state.previous_window_size == 400
+    assert (
+        resolve_zoom_anchor(state, None, 1024, 1024, RATE_LIMIT_ONLY).window.width
+        == 340
+    )
 
 
 def test_degenerate_boxes_are_refused_rather_than_quietly_repaired():

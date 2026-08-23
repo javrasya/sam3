@@ -61,6 +61,7 @@ __all__ = [
     "plan_processing_passes",
     "plan_processing_order",
     "should_re_ground",
+    "re_grounding_is_fresh",
     "resolve_zoom_anchor",
     "resolve_zoom_anchors",
     "advance_object_state",
@@ -80,6 +81,10 @@ class ZoomAnchorSource(str, Enum):
 
     A run that quietly degraded to ``FULL_FRAME`` on every frame is otherwise
     indistinguishable from a fully re-grounded one; recording this is the point.
+
+    ``FULL_FRAME`` means nothing was cropped, for either of the reasons
+    :func:`resolve_zoom_anchor` documents: nothing is known about where the Object
+    is, or it is too big for zooming to buy anything.
     """
 
     RE_GROUNDED = "re-grounded"
@@ -93,8 +98,8 @@ class ZoomAnchorSource(str, Enum):
 class ZoomWindow:
     """A region of a frame, x2/y2 exclusive.
 
-    Every window is square except the full-frame fallback -- see
-    :func:`resolve_zoom_anchor` for why that one is not.
+    Every window is square except the whole frame -- see
+    :func:`resolve_zoom_anchor` for the two cases that produce that one.
     """
 
     x1: int
@@ -142,8 +147,18 @@ class ZoomAnchorConfig:
         area_collapse_ratio: If an Object's mask area drops below this fraction of
             the area one frame earlier, window size is frozen instead of followed
             downward.
+        max_window_frame_fraction: An Object whose Zoom Window would reach this
+            fraction of the frame's shorter side is not zoomed at all -- the whole
+            frame is used. Cropping to a square that large buys no resolution, and
+            for an Object wider than the frame is tall it would cut the Object off
+            at the window edges on every frame. See :func:`resolve_zoom_anchor`.
         re_grounding_interval: Tick cadence -- one Re-grounding request every N
             frames. ``N`` means N, not N+1.
+        max_re_grounding_age: How many frames after the frame it describes a
+            Re-grounding answer may still be applied as *fresh*. A vision model
+            slower than the frame rate answers about a frame the pass has long
+            left behind; past this age the answer is only that Object's stale box,
+            which the precedence ranks below the Object's own current mask.
     """
 
     crop_padding: float = 0.5
@@ -151,7 +166,9 @@ class ZoomAnchorConfig:
     min_size_fraction: float = 1.0 / 6.0
     min_size_px: int = 32
     area_collapse_ratio: float = 0.5
+    max_window_frame_fraction: float = 0.9
     re_grounding_interval: int = 5
+    max_re_grounding_age: int = 1
 
     def __post_init__(self):
         if self.crop_padding < 0:
@@ -164,8 +181,12 @@ class ZoomAnchorConfig:
             raise ValueError("min_size_px must be >= 1")
         if not 0 < self.area_collapse_ratio <= 1:
             raise ValueError("area_collapse_ratio must be in (0, 1]")
+        if not 0 < self.max_window_frame_fraction <= 1:
+            raise ValueError("max_window_frame_fraction must be in (0, 1]")
         if self.re_grounding_interval < 1:
             raise ValueError("re_grounding_interval must be >= 1")
+        if self.max_re_grounding_age < 0:
+            raise ValueError("max_re_grounding_age must be >= 0")
 
 
 DEFAULT_ZOOM_ANCHOR_CONFIG = ZoomAnchorConfig()
@@ -309,6 +330,30 @@ def should_re_ground(
     return step % config.re_grounding_interval == 0
 
 
+# DISCERN FORK LOCAL ADDITION
+def re_grounding_is_fresh(
+    described_frame: int,
+    frame_index: int,
+    config: ZoomAnchorConfig = DEFAULT_ZOOM_ANCHOR_CONFIG,
+) -> bool:
+    """Whether a Re-grounding answer still describes where the Object is now.
+
+    A request asks where an Object is on the frame it was made for; the answer is
+    about *that* frame, whenever it happens to arrive. Requests are not waited on,
+    so a provider slower than the frame rate answers about a frame the pass left
+    behind several frames ago.
+
+    Only an answer no older than ``max_re_grounding_age`` frames may be used as
+    ``fresh_re_grounding``, because a fresh Re-grounding outranks the Object's own
+    mask bounding box. An older one is worth exactly what the precedence says a
+    stale box is worth -- pass it to :func:`advance_object_state` instead, where it
+    becomes the Object's ``stale_re_grounding`` and loses to any current mask.
+
+    Distance is measured in frames, unsigned: a backward pass counts down.
+    """
+    return abs(frame_index - described_frame) <= config.max_re_grounding_age
+
+
 def _place_square(
     center_x: float,
     center_y: float,
@@ -320,8 +365,8 @@ def _place_square(
 
     Clamping translates the window rather than shrinking it, so the window stays
     square at a frame edge; the caller keeps the size it asked for and the Object
-    simply sits off-centre. ``size`` is already capped at the frame's shorter side
-    by :func:`_locked_size`, so a square of it always fits.
+    simply sits off-centre. A square too large to fit never reaches here:
+    :func:`resolve_zoom_anchor` uses the whole frame instead of cropping to it.
     """
     x1 = int(round(center_x - size / 2.0))
     y1 = int(round(center_y - size / 2.0))
@@ -337,7 +382,12 @@ def _locked_size(
     frame_height: int,
     config: ZoomAnchorConfig,
 ) -> int:
-    """Zoom Lock plus its three guards, in the order they must be applied."""
+    """Zoom Lock plus its three guards, in the order they must be applied.
+
+    The size returned is what the Object asks for, not what fits: deciding that a
+    window this large is not worth cropping to belongs to
+    :func:`resolve_zoom_anchor`, which has the whole frame to fall back on.
+    """
     x1, y1, x2, y2 = anchor_bbox
 
     # Zoom Lock: size proportional to the Object, so apparent size after SAM3's
@@ -371,11 +421,7 @@ def _locked_size(
         config.min_size_px,
         int(round(min(frame_width, frame_height) * config.min_size_fraction)),
     )
-    size = max(size, floor)
-
-    # A square larger than the frame's shorter side cannot fit. Capping here is
-    # the only thing that overrides the floor, and only because geometry says so.
-    return max(1, min(size, min(frame_width, frame_height)))
+    return max(1, max(size, floor))
 
 
 def _select_anchor(
@@ -411,20 +457,34 @@ def resolve_zoom_anchor(
     """Resolve one Object's Zoom Window on one frame.
 
     ``fresh_re_grounding`` is that Object's box from a Re-grounding request that
-    was made *and* answered on this frame; ``None`` covers every other case (no
-    tick, a failed request, or a response that did not mention this Object).
+    was made for this frame and is no older than ``max_re_grounding_age`` frames
+    (see :func:`re_grounding_is_fresh`); ``None`` covers every other case (no tick,
+    a failed request, an answer that arrived too late, or a response that did not
+    mention this Object).
 
-    The full-frame fallback returns the entire frame and is the one window that is
-    not square: a square could not contain a non-square frame, and this fallback
-    exists precisely because nothing is known about where the Object is -- there is
-    no defensible side to crop off.
+    Two things produce the whole frame rather than a square, and both are recorded
+    as ``FULL_FRAME`` because in both nothing was cropped:
+
+    * Nothing is known about where the Object is. A square could not contain a
+      non-square frame anyway, and there is no defensible side to crop off.
+    * The Object is too big to zoom -- the window it asks for reaches
+      ``max_window_frame_fraction`` of the frame's shorter side. Cropping to the
+      largest square that fits would gain no resolution and would truncate an
+      Object wider than the frame is tall at the window edges, on every frame,
+      permanently: the next window re-anchors on the truncated mask and lands in
+      the same place. Running the frame whole is strictly better, and saying so in
+      the record is what makes the lost zoom visible.
     """
     _validate_frame_size(frame_width, frame_height)
+    full_frame = ZoomWindow(0, 0, frame_width, frame_height)
     anchor_bbox, source = _select_anchor(state, fresh_re_grounding)
     if anchor_bbox is None:
-        return ZoomAnchor(ZoomWindow(0, 0, frame_width, frame_height), source)
+        return ZoomAnchor(full_frame, source)
 
     size = _locked_size(anchor_bbox, state, frame_width, frame_height, config)
+    if size >= min(frame_width, frame_height) * config.max_window_frame_fraction:
+        return ZoomAnchor(full_frame, ZoomAnchorSource.FULL_FRAME)
+
     x1, y1, x2, y2 = anchor_bbox
     window = _place_square(
         (x1 + x2) / 2.0, (y1 + y2) / 2.0, size, frame_width, frame_height
@@ -466,30 +526,36 @@ def advance_object_state(
     state: ObjectZoomState,
     mask_bbox: Optional[BBox],
     mask_area: Optional[int],
-    window: ZoomWindow,
+    anchor: ZoomAnchor,
     fresh_re_grounding: Optional[BBox] = None,
 ) -> ObjectZoomState:
     """Carry one Object's state to the next frame.
 
-    Pass what actually happened. ``mask_bbox=None`` means the Object produced no
-    mask on this frame, and the next frame will therefore fall through to the
-    stale Re-grounding box or the full frame -- absent means absent, and the
-    resolver will not quietly keep pointing at a mask that is no longer there.
-    A caller that would rather hold the anchor for one dropped frame should keep
-    the current state instead of calling this.
+    Pass what actually happened, including the :class:`ZoomAnchor` the frame was
+    resolved with. ``mask_bbox=None`` means the Object produced no mask on this
+    frame, and the next frame will therefore fall through to the stale
+    Re-grounding box or the full frame -- absent means absent, and the resolver
+    will not quietly keep pointing at a mask that is no longer there. A caller
+    that would rather hold the anchor for one dropped frame should keep the
+    current state instead of calling this.
 
-    The window size is remembered only when the window was square, so the
-    full-frame fallback does not reset the rate limit to the whole frame.
+    The window size is remembered only when a window was actually cropped, so
+    neither full-frame case resets the rate limit to the whole frame. It is the
+    anchor's *source* that says so, not the window's shape: on a square-resolution
+    video the full frame is itself a square, and reading squareness there stored
+    the whole frame as the size to pace against, holding the window near
+    full-frame for a dozen frames after the Object was reacquired.
     """
     if mask_bbox is not None:
         _validate_bbox(mask_bbox, "mask_bbox")
+    cropped = anchor.source is not ZoomAnchorSource.FULL_FRAME
     return replace(
         state,
         previous_bbox=mask_bbox,
         previous_mask_area=mask_area,
         earlier_mask_area=state.previous_mask_area,
         previous_window_size=(
-            window.width if window.is_square else state.previous_window_size
+            anchor.window.width if cropped else state.previous_window_size
         ),
         stale_re_grounding=(
             fresh_re_grounding

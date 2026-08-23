@@ -47,6 +47,7 @@ from sam3.zoom_anchor import (
     ZoomAnchorConfig,
     ZoomAnchorSource,
     advance_object_state,
+    re_grounding_is_fresh,
     resolve_zoom_anchors,
     should_re_ground,
 )
@@ -205,6 +206,9 @@ class PassLedger:
             source.value: 0 for source in ZoomAnchorSource
         }
         self._absent_observations = 0
+        self._tick_frames = set()
+        self._skipped_tick_frames = set()
+        self._aged_re_groundings = 0
 
     # DISCERN FORK LOCAL ADDITION
     @property
@@ -256,7 +260,67 @@ class PassLedger:
         """
         if not self._active:
             return False
-        return should_re_ground(frame_index, self._seed_frame, self._config)
+        due = should_re_ground(frame_index, self._seed_frame, self._config)
+        if due:
+            # Keyed by frame so asking twice about one frame counts it once: the
+            # denominator of the effective cadence has to be frames, not calls.
+            self._tick_frames.add(frame_index)
+        return due
+
+    # DISCERN FORK LOCAL ADDITION
+    def note_tick_skipped(self, frame_index: int) -> int:
+        """Record a tick that issued nothing because the last request is in flight.
+
+        The cadence a person chose is only the cadence they got while the provider
+        answers faster than ``interval`` frames take. When it does not, requests
+        go out every *latency* frames instead, and the only honest thing to do is
+        count it: :meth:`effective_re_grounding_interval` turns the count into the
+        number they actually got, and the pass summary carries it out of the loop.
+
+        Returns the number of frames in this pass whose tick issued nothing.
+        """
+        self._skipped_tick_frames.add(frame_index)
+        return len(self._skipped_tick_frames)
+
+    # DISCERN FORK LOCAL ADDITION
+    def effective_re_grounding_interval(self) -> Optional[float]:
+        """Frames per Re-grounding request actually issued, or None before any tick.
+
+        ``interval * ticks_due / ticks_issued``: with nothing skipped it is the
+        configured interval, and with two ticks in three skipped it is three times
+        it, which is the number worth telling the annotator.
+        """
+        due = len(self._tick_frames)
+        if due == 0:
+            return None
+        issued = due - len(self._skipped_tick_frames)
+        if issued < 1:
+            return None
+        return self._config.re_grounding_interval * due / issued
+
+    # DISCERN FORK LOCAL ADDITION
+    def classify_re_grounding(
+        self,
+        boxes: Mapping[int, BBox],
+        described_frame: int,
+        frame_index: int,
+    ) -> Tuple[Dict[int, BBox], Dict[int, BBox]]:
+        """Split an arrived Re-grounding answer by how old it is.
+
+        Returns ``(fresh, aged)``. ``fresh`` may anchor this frame, where it
+        outranks the Object's own mask. ``aged`` may not: it describes where the
+        Object was on a frame the pass has already left behind, and preferring it
+        to the mask produced on the previous frame is exactly the lag this feature
+        is being cured of. Hand ``aged`` to :meth:`record_frame` anyway -- it
+        becomes each Object's stale box, which the precedence ranks *below* a
+        current mask and above nothing at all.
+        """
+        if not boxes:
+            return {}, {}
+        if re_grounding_is_fresh(described_frame, frame_index, self._config):
+            return dict(boxes), {}
+        self._aged_re_groundings += len(boxes)
+        return {}, dict(boxes)
 
     # DISCERN FORK LOCAL ADDITION
     def resolve(
@@ -320,7 +384,7 @@ class PassLedger:
                 absent.append(obj_id)
                 self._streaks[obj_id] += 1
                 self._states[obj_id] = advance_object_state(
-                    self._states[obj_id], None, None, anchor.window, fresh
+                    self._states[obj_id], None, None, anchor, fresh
                 )
                 if self._streaks[obj_id] >= self._absence_streak_limit:
                     self._active.discard(obj_id)
@@ -331,7 +395,7 @@ class PassLedger:
                     self._states[obj_id],
                     observation.bbox,
                     observation.area,
-                    anchor.window,
+                    anchor,
                     fresh,
                 )
 
@@ -345,8 +409,19 @@ class PassLedger:
 
     # DISCERN FORK LOCAL ADDITION
     def pass_summary(self) -> str:
-        """One line for the end of the pass: where every window actually came from."""
+        """One line for the end of the pass: where every window actually came from.
+
+        It also carries what the Re-grounding cadence really was. A tick that
+        issues nothing, and an answer that arrives too late to anchor with, are
+        both invisible frame by frame and both mean the annotator's chosen
+        interval is not the interval they got.
+        """
         parts = [f"{name}={count}" for name, count in self._source_counts.items()]
         parts.append(f"absent={self._absent_observations}")
         parts.append(f"stopped={list(self.stopped_object_ids)}")
+        parts.append(f"ticks_skipped={len(self._skipped_tick_frames)}")
+        parts.append(f"re_groundings_too_late={self._aged_re_groundings}")
+        effective = self.effective_re_grounding_interval()
+        if effective is not None:
+            parts.append(f"effective_interval={effective:.1f}")
         return " ".join(parts)

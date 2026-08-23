@@ -18,7 +18,7 @@ from sam3.zoom_anchor import (
 from sam3.zoom_pass import (
     DEFAULT_ZOOM_PASS_CONFIG,
     MaskOutcome,
-    MaskRefinement,
+    MaskOutcomeRecord,
     ObjectMaskGeometry,
     ZoomPassConfig,
     ZoomPassReport,
@@ -54,7 +54,7 @@ def plan(frame_masks, states=None, config=DEFAULT_ZOOM_PASS_CONFIG):
 
 
 def improved(frame_index, object_id, score=0.8):
-    return MaskRefinement(
+    return MaskOutcomeRecord(
         frame_index=frame_index,
         object_id=object_id,
         outcome=MaskOutcome.IMPROVED,
@@ -64,7 +64,7 @@ def improved(frame_index, object_id, score=0.8):
 
 
 def unchanged(frame_index, object_id, outcome):
-    return MaskRefinement(
+    return MaskOutcomeRecord(
         frame_index=frame_index,
         object_id=object_id,
         outcome=outcome,
@@ -142,11 +142,20 @@ def test_every_planned_window_is_square():
     plans = plan(
         {
             1: geometry_at(200, 540, 100),
-            2: geometry_at(1700, 200, 640),
+            2: geometry_at(1700, 200, 400),
         }
     )
 
     assert all(p.window.is_square for p in plans.values())
+
+
+def test_an_object_too_big_to_zoom_is_planned_on_the_whole_frame_and_abandoned():
+    """The resolver refuses to truncate it; the pass then has nothing to gain."""
+    plans = plan({1: geometry_at(960, 540, 900)})
+
+    assert plans[1].window.as_tuple() == (0, 0, WIDTH, HEIGHT)
+    assert plans[1].anchor_source is ZoomAnchorSource.FULL_FRAME
+    assert plans[1].zoom_is_beneficial is False
 
 
 def test_every_planned_window_lies_inside_the_frame():
@@ -191,8 +200,8 @@ def test_the_rate_limit_paces_growth_between_processed_frames():
 
 
 def test_a_collapsed_mask_does_not_shrink_the_window():
-    frame_one = plan({1: geometry_at(960, 540, 600)})
-    frame_two = plan({1: geometry_at(960, 540, 590)}, {1: frame_one[1].next_state})
+    frame_one = plan({1: geometry_at(960, 540, 400)})
+    frame_two = plan({1: geometry_at(960, 540, 390)}, {1: frame_one[1].next_state})
     collapsed = plan({1: geometry_at(960, 540, 40)}, {1: frame_two[1].next_state})
 
     assert collapsed[1].window.width >= frame_two[1].window.width * 0.99
@@ -266,8 +275,8 @@ def test_abandonment_is_per_object_not_shared():
 
 def test_is_zoom_beneficial_follows_the_configured_fraction():
     window = ZoomWindow(0, 0, 1000, 1000)
-    strict = ZoomPassConfig(max_window_frame_fraction=0.4)
-    lax = ZoomPassConfig(max_window_frame_fraction=0.99)
+    strict = ZoomPassConfig(anchor=ZoomAnchorConfig(max_window_frame_fraction=0.4))
+    lax = ZoomPassConfig(anchor=ZoomAnchorConfig(max_window_frame_fraction=0.99))
 
     assert is_zoom_beneficial(window, WIDTH, HEIGHT, strict) is False
     assert is_zoom_beneficial(window, WIDTH, HEIGHT, lax) is True
@@ -310,7 +319,7 @@ def test_an_abandoned_object_carries_no_score_at_all():
 
 def test_an_untouched_mask_cannot_be_scored_maximally_confident():
     with pytest.raises(ValueError):
-        MaskRefinement(
+        MaskOutcomeRecord(
             frame_index=7,
             object_id=1,
             outcome=MaskOutcome.NOT_DETECTED,
@@ -321,7 +330,7 @@ def test_an_untouched_mask_cannot_be_scored_maximally_confident():
 
 def test_an_improved_mask_must_say_what_it_scored():
     with pytest.raises(ValueError):
-        MaskRefinement(
+        MaskOutcomeRecord(
             frame_index=7,
             object_id=1,
             outcome=MaskOutcome.IMPROVED,
@@ -399,7 +408,7 @@ def test_the_verdict_reports_which_zoom_anchors_were_used():
     report = ZoomPassReport()
     report.record(improved(0, 1))
     report.record(
-        MaskRefinement(
+        MaskOutcomeRecord(
             frame_index=1,
             object_id=1,
             outcome=MaskOutcome.NOT_DETECTED,
@@ -435,7 +444,7 @@ def test_the_summary_of_an_empty_pass_says_there_was_nothing_to_do():
     assert "no propagated mask" in ZoomPassReport().summary()
 
 
-def test_the_report_refuses_anything_that_is_not_a_refinement():
+def test_the_report_refuses_anything_that_is_not_an_outcome_record():
     with pytest.raises(TypeError):
         ZoomPassReport().record({"object_id": 1})
 
@@ -447,9 +456,9 @@ def test_the_report_refuses_anything_that_is_not_a_refinement():
 
 def test_an_out_of_range_abandonment_fraction_is_refused():
     with pytest.raises(ValueError):
-        ZoomPassConfig(max_window_frame_fraction=0)
+        ZoomAnchorConfig(max_window_frame_fraction=0)
     with pytest.raises(ValueError):
-        ZoomPassConfig(max_window_frame_fraction=1.5)
+        ZoomAnchorConfig(max_window_frame_fraction=1.5)
 
 
 def test_the_pass_hands_its_anchor_settings_to_the_resolver():
