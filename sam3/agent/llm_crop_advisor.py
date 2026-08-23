@@ -1,17 +1,20 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
 """
-LLM-guided crop zone prediction for video tracking.
+Re-grounding transport: asking a vision model where an Object is, one request
+per Object.
 
-Uses a vision LLM to predict per-frame crop zones during propagation,
-so the SAM3 tracker always sees small objects at high effective resolution.
+Re-grounding is Discern's name for locating an Object afresh from its Object
+Hint, discarding what the mask chain believed. This module is the part of it that
+needs images, a network and threads: it renders the previous frame with that one
+Object highlighted, sends it with the current frame and the Object's Hint, and
+hands back the box the model answered with. It does not predict where an Object
+will be, and it decides nothing about Zoom Windows.
 
 DISCERN FORK LOCAL ADDITION -- this whole module is local to javrasya/sam3 and has
-no upstream counterpart (see Discern ADR 0002). In Discern's vocabulary what it
-does is Re-grounding: asking a vision model to locate an Object afresh from its
-Object Hint. The request/response contract lives in :mod:`sam3.re_grounding`;
-window geometry lives in :mod:`sam3.zoom_anchor`; this module is the part that
-needs images, a network and threads.
+no upstream counterpart (see Discern ADR 0002). The request/response contract
+lives in :mod:`sam3.re_grounding`; window geometry, including all padding, lives
+in :mod:`sam3.zoom_anchor`.
 """
 
 import logging
@@ -82,14 +85,17 @@ def _frame_size(frame):
 
 class LLMCropAdvisor:
     """
-    Handles LLM communication for predicting crop zones during video tracking.
+    The vision-model side of Re-grounding: one request per Object, concurrently.
 
-    Uses a vision LLM to analyze previous frame masks and current frame appearance
-    to predict where objects will be, enabling high-resolution cropped tracking.
+    Each request carries a single Object -- the previous frame with that Object's
+    own mask and box drawn on it, the current frame, and that Object's Object Hint
+    -- and asks the model to locate it in the current frame, or to say plainly
+    that it cannot see it. It is asked about the frame in front of it, never about
+    where the Object is heading.
 
-    One Re-grounding request per Object, not one request for all of them: a shared
-    request makes every Object compete for one response budget, and one malformed
-    entry silently unguides an Object nobody was told about.
+    One request per Object, not one for all of them: a shared request makes every
+    Object compete for one response budget, and one malformed entry silently
+    unguides an Object nobody was told about.
     """
 
     def __init__(
@@ -97,7 +103,7 @@ class LLMCropAdvisor:
         server_url,
         model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
         api_key=None,
-        crop_padding=0.5,
+        crop_padding=None,
         max_tokens=DEFAULT_RE_GROUNDING_MAX_TOKENS,
         request_timeout=DEFAULT_RE_GROUNDING_TIMEOUT_S,
         max_concurrent_requests=DEFAULT_RE_GROUNDING_CONCURRENCY,
@@ -108,9 +114,11 @@ class LLMCropAdvisor:
             server_url: OpenAI-compatible API endpoint URL
             model: Model name/ID for the API
             api_key: Optional API key
-            crop_padding: Retained for callers that still construct the advisor
-                with it. Nothing here pads anything: Re-grounding returns raw
-                located boxes and :mod:`sam3.zoom_anchor` owns the padding.
+            crop_padding: Accepted and ignored, so callers that still pass it
+                keep working. Nothing here pads anything: Re-grounding returns the
+                raw located box and :mod:`sam3.zoom_anchor` owns every decision
+                about how much frame goes around it. It is deliberately not stored
+                -- a field would read as live configuration that changes something.
             max_tokens: Max tokens for one Object's response
             request_timeout: Seconds one Object's request may take, and the budget
                 for a whole frame's batch of them
@@ -122,7 +130,6 @@ class LLMCropAdvisor:
         self.server_url = server_url
         self.model = model
         self.api_key = api_key
-        self.crop_padding = crop_padding
         self.max_tokens = max_tokens
         self.request_timeout = request_timeout
         self.max_concurrent_requests = max_concurrent_requests
@@ -365,49 +372,33 @@ class LLMCropAdvisor:
         except OSError as exc:
             logger.warning("could not delete temporary image %s: %s", path, exc)
 
+    # DISCERN FORK LOCAL ADDITION
     @staticmethod
     def _save_temp_image(pil_image):
-        """Save PIL image to a temporary file and return the path."""
+        """Write one request image to a temporary file and return its path.
+
+        The file exists before the encode does, so a failed encode has to delete
+        it here: the path has not been returned yet, so the caller's ``finally``
+        has nothing to clean up and the file would be leaked for the life of the
+        session -- one per Object per tick.
+
+        JPEG cannot hold an alpha channel, and frames read from RGBA PNGs arrive
+        with one, so the image is converted rather than allowed to raise.
+        """
+        image = (
+            pil_image
+            if isinstance(pil_image, Image.Image)
+            else Image.fromarray(np.array(pil_image))
+        )
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        if isinstance(pil_image, Image.Image):
-            pil_image.save(tmp, format="JPEG", quality=85)
-        else:
-            Image.fromarray(np.array(pil_image)).save(tmp, format="JPEG", quality=85)
-        tmp.close()
+        try:
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            image.save(tmp, format="JPEG", quality=85)
+            tmp.close()
+        except BaseException:
+            tmp.close()
+            LLMCropAdvisor._delete_temp_image(tmp.name)
+            raise
         return tmp.name
 
-
-def interpolate_crop_zones(prev_zones, next_zones, alpha):
-    """
-    Linearly interpolate between two sets of crop zones.
-
-    Args:
-        prev_zones: dict {obj_id: (x1, y1, x2, y2)} from last LLM call
-        next_zones: dict {obj_id: (x1, y1, x2, y2)} from next LLM call (or None)
-        alpha: interpolation factor in [0, 1] (0 = prev, 1 = next)
-
-    Returns:
-        dict {obj_id: (x1, y1, x2, y2)} interpolated crop zones
-    """
-    if next_zones is None or alpha <= 0:
-        return prev_zones
-    if alpha >= 1:
-        return next_zones
-
-    result = {}
-    for obj_id in prev_zones:
-        if obj_id in next_zones:
-            p = prev_zones[obj_id]
-            n = next_zones[obj_id]
-            result[obj_id] = tuple(
-                int(p[i] * (1 - alpha) + n[i] * alpha) for i in range(4)
-            )
-        else:
-            result[obj_id] = prev_zones[obj_id]
-
-    # Include any objects only in next_zones
-    for obj_id in next_zones:
-        if obj_id not in result:
-            result[obj_id] = next_zones[obj_id]
-
-    return result

@@ -352,3 +352,44 @@ def test_the_temporary_images_are_deleted_after_an_unreadable_answer():
     re_ground(provider, object_ids=(1,))
 
     assert [path for path in provider.calls[0]["images"] if os.path.exists(path)] == []
+
+
+def test_an_image_that_cannot_be_encoded_leaves_no_file_behind(tmp_path, monkeypatch):
+    """The file exists before the encode does, so a failed encode must remove it.
+
+    Nothing else can: the path is not returned, so it never reaches the list the
+    request's ``finally`` deletes, and one file per Object per tick accumulates
+    for the life of the session.
+    """
+    import tempfile
+
+    from PIL import Image
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    def cannot_encode(self, *args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(Image.Image, "save", cannot_encode)
+
+    result = re_ground(Provider(), object_ids=(1, 2))
+
+    assert sorted(result.failures) == [1, 2]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_frame_with_an_alpha_channel_is_still_re_grounded():
+    """JPEG holds no alpha, and frames read from RGBA PNGs arrive with one."""
+    from PIL import Image
+
+    provider = Provider()
+    rgba = Image.new("RGBA", (WIDTH, HEIGHT), (128, 128, 128, 255))
+
+    result = advisor(provider).re_ground_objects(
+        prev_frame=rgba,
+        curr_frame=rgba,
+        object_ids=[1],
+        prev_masks={1: mask_at(10, 10, 30, 40)},
+    )
+
+    assert result.per_object[1].outcome is ReGroundingOutcome.LOCATED
