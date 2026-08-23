@@ -42,6 +42,7 @@ from sam3.zoom_anchor import (
     ZoomAnchorConfig,
     plan_processing_passes,
 )
+from sam3.re_grounding import own_frame
 from sam3.zoom_propagation import (
     DEFAULT_ABSENCE_STREAK_LIMIT,
     MaskObservation,
@@ -1835,7 +1836,7 @@ class Sam3UnifiedProcessor:
                 absence_streak_limit=absence_streak_limit,
             )
             prev_masks_per_obj = dict(initial_masks)
-            prev_frame = self._get_frame(state, start_frame)
+            prev_frame = own_frame(self._get_frame(state, start_frame))
             pending = None
             pending_frame = None
             last_summary = None
@@ -1849,7 +1850,7 @@ class Sam3UnifiedProcessor:
             for frame_idx in tqdm(
                 pass_.frames, desc=f"propagate with LLM crop ({pass_.direction})"
             ):
-                curr_frame = self._get_frame(state, frame_idx)
+                curr_frame = own_frame(self._get_frame(state, frame_idx))
                 if curr_frame is None:
                     raise RuntimeError(
                         f"Could not read frame {frame_idx} of {num_frames}; "
@@ -1996,6 +1997,26 @@ class Sam3UnifiedProcessor:
                             (orig_h, orig_w),
                         ).squeeze(0)
                         binary = (full_mask > 0.5).cpu()
+
+                        # DISCERN FORK LOCAL ADDITION -- geometry read-out.
+                        # A Zoom Window is only useful if the mask that comes out
+                        # of it is the size the Object is. Reporting the window,
+                        # what the crop returned, and what survived the paste
+                        # separates "the window was wrong" from "SAM3 found
+                        # something tiny inside a correct window" from "the paste
+                        # lost it" -- which the anchor source alone cannot.
+                        crop_binary = crop_masks[best_idx] > 0.5
+                        logger.info(
+                            f"[ZOOM] frame {frame_idx} obj {obj_id}: "
+                            f"window={window.as_tuple()} "
+                            f"{window.width}x{window.height} "
+                            f"crop={cropped_frame.size if hasattr(cropped_frame, 'size') else 'n/a'} "
+                            f"detections={len(crop_masks)} "
+                            f"chosen={best_idx} score={best_score:.3f} "
+                            f"crop_px={int(crop_binary.sum().item())} "
+                            f"mask_shape={tuple(crop_masks[best_idx].shape)} "
+                            f"pasted_px={int(binary.sum().item())}"
+                        )
                         bbox = mask_to_bbox(binary)
                         if bbox is not None:
                             observation = MaskObservation(

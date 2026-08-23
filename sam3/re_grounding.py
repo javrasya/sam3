@@ -408,3 +408,33 @@ def parse_re_grounding_response(
             f"{frame_width}x{frame_height}"
         )
     return pixels
+
+
+# DISCERN FORK LOCAL ADDITION -- not part of upstream SAM3 (see Discern ADR 0002).
+def own_frame(frame):
+    """A private, fully-decoded copy of a frame, safe to hand to a worker thread.
+
+    Discern opens session frames lazily (``Image.open`` with no ``load``) and
+    hands the same objects to every consumer. PIL's ``load`` is a mutation: it
+    consumes the file pointer and clears the tile list. So a Re-grounding worker
+    decoding one of those images while the propagation loop is also decoding it
+    crashes on ``assert self.fp is not None`` -- not because either side did
+    anything wrong, but because neither owned the image.
+
+    Decoding here, on the thread that reads the frame, and passing only the copy
+    onwards means no two threads ever touch one image. Shapes are recognised by
+    behaviour rather than by type so this module stays free of PIL, numpy and
+    torch, and can be tested with none of them installed.
+    """
+    if frame is None:
+        return None
+    convert = getattr(frame, "convert", None)  # PIL: decodes, then copies
+    if callable(convert):
+        return convert("RGB")
+    clone = getattr(frame, "clone", None)  # torch
+    if callable(clone):
+        return clone()
+    copy = getattr(frame, "copy", None)  # numpy
+    if callable(copy):
+        return copy()
+    return frame
