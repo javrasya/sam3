@@ -1,0 +1,4 @@
+# Python sources in this fork are LF, as upstream SAM3 keeps them. Without this a
+# checkout on Windows rewrites a whole file to CRLF and turns a small change into a
+# whole-file diff that no future merge or cherry-pick can survive (see Discern ADR 0002).
+*.py text eol=lf
