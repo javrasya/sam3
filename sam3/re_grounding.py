@@ -83,7 +83,7 @@ DEFAULT_RE_GROUNDING_CONCURRENCY = 4
 # *thinking* tokens -- a thinking model can spend the whole budget before emitting
 # any content, which arrives here as an empty message. The old shared-across-all-
 # Objects budget of 512 is a prime suspect for "the feature never ran".
-DEFAULT_RE_GROUNDING_MAX_TOKENS = 1024
+DEFAULT_RE_GROUNDING_MAX_TOKENS = 8192
 
 RE_GROUNDING_SYSTEM_PROMPT = """\
 You locate one specific object in a video frame.

@@ -169,6 +169,7 @@ class ZoomAnchorConfig:
     max_window_frame_fraction: float = 0.9
     re_grounding_interval: int = 5
     max_re_grounding_age: int = 1
+    re_grounding_blocks_the_pass: bool = True
 
     def __post_init__(self):
         if self.crop_padding < 0:

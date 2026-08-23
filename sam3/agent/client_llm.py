@@ -214,11 +214,21 @@ def send_vision_request(
 
     if not response.choices:
         raise ValueError(f"provider returned no choices: {response}")
-    content = response.choices[0].message.content
+    choice = response.choices[0]
+    content = choice.message.content
     if content is None:
         raise ValueError(
             "provider returned an empty message -- a reasoning model can spend the "
             f"whole max_completion_tokens budget ({max_tokens}) before emitting any"
+        )
+    if getattr(choice, "finish_reason", None) == "length":
+        # The answer stops mid-token, so whatever arrived is a fragment. Parsing
+        # it reports "no JSON object in the provider's answer", which reads like
+        # a model that replied badly rather than a budget that ran out -- and
+        # sends the reader looking in the wrong place entirely.
+        raise ValueError(
+            f"provider stopped at the max_completion_tokens budget ({max_tokens}) "
+            f"with the answer unfinished: {content[:80]!r}"
         )
     return content
 

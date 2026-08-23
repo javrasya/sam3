@@ -1934,15 +1934,51 @@ class Sam3UnifiedProcessor:
                             for obj_id in ledger.active_object_ids
                             if prev_masks_per_obj.get(obj_id) is not None
                         }
-                        pending_frame = frame_idx
-                        pending = executor.submit(
-                            _request_re_grounding,
-                            prev_frame,
-                            ledger.active_object_ids,
-                            request_masks,
-                            ledger.previous_bboxes(),
-                            curr_frame,
-                        )
+                        if anchor_config.re_grounding_blocks_the_pass:
+                            # Ask, and wait for the answer before framing this
+                            # frame. A tick that does not wait spends a provider
+                            # call it can never use: by the time the answer
+                            # arrives the pass has moved on, so the answer is a
+                            # stale box, and the precedence ranks a stale box
+                            # below the Object's own mask. Measured on a 2.2s
+                            # frame with a 3.6s provider, that was every single
+                            # tick -- an entire run anchored on nothing but its
+                            # own masks while paying for Re-grounding throughout.
+                            pending_frame = frame_idx
+                            result = _request_re_grounding(
+                                prev_frame,
+                                ledger.active_object_ids,
+                                request_masks,
+                                ledger.previous_bboxes(),
+                                curr_frame,
+                            )
+                            accepted, rejected = partition_re_grounding(result)
+                            if rejected:
+                                logger.warning(
+                                    f"[ZOOM] frame {frame_idx}: discarded "
+                                    f"malformed Re-grounding boxes {rejected}"
+                                )
+                            if result.every_request_failed:
+                                logger.error(
+                                    f"[ZOOM] frame {frame_idx}: every "
+                                    "Re-grounding request failed "
+                                    f"({result.failures}); windows follow each "
+                                    "Object's own mask until a later tick "
+                                    "succeeds"
+                                )
+                            # Asked about this frame and answered before it was
+                            # framed, so nothing here can be aged.
+                            fresh_re_grounding.update(accepted)
+                        else:
+                            pending_frame = frame_idx
+                            pending = executor.submit(
+                                _request_re_grounding,
+                                prev_frame,
+                                ledger.active_object_ids,
+                                request_masks,
+                                ledger.previous_bboxes(),
+                                curr_frame,
+                            )
 
                 anchors = ledger.resolve(fresh_re_grounding)
 
