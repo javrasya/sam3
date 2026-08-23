@@ -38,5 +38,5 @@ no network — so they are testable without a model. `tests/` exists only for th
 | `sam3/zoom_anchor.py` | Every decision about Zoom Window geometry and about the order frames are processed in: anchor precedence, the Zoom Lock and its guards, the tick cadence, how late a Re-grounding answer may be, and when an Object is too big for zooming to be worth anything. Shared by both consumers, so a fix reaches both. |
 | `sam3/zoom_propagation.py` | Per-Object bookkeeping for one propagation pass: which Objects are still being propagated, the per-frame Zoom Anchor record, the absence streak. |
 | `sam3/re_grounding.py` | The Re-grounding request/response contract: prompt, parsing, per-Object outcomes. Stdlib only. |
-| `sam3/zoom_pass.py` | The Zoom Pass's own decisions: per-Object abandonment and honest per-mask outcomes. **Not yet called by Discern** — wiring `Sam3Backend.refine_all_frames` onto it is a follow-up. |
+| `sam3/zoom_pass.py` | The Zoom Pass's own decisions: per-Object abandonment and honest per-mask outcomes. Called by Discern's `Sam3Backend.refine_all_frames`. |
 | `sam3/agent/llm_crop_advisor.py` | The transport for Re-grounding: images, threads and a provider. Rewritten from a single combined request to one request per Object. |

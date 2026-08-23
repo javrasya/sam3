@@ -35,15 +35,13 @@ Its own verdict
 Vocabulary is Discern's glossary (see Discern ``CONTEXT.md``). Nothing here is
 named *refinement*: the glossary reserves that word for the workflow state in
 which a person hand-corrects frames, and this pass is automated end to end.
-Discern's caller is still spelled ``Sam3Backend.refine_all_frames`` -- that is the
-legacy name this vocabulary replaces, and the mapping is recorded here so it stays
-findable rather than being carried into new type names.
-
-Nothing in either repository calls this module yet: Discern's Zoom Pass still runs
-the older shared-union-window code that ``refine_all_frames`` was written around,
-and moving it onto these decisions is a follow-up of its own (see the Zoom Pass
-backend hand-off note for spec javrasya/discern#91). Until then this module is
-exercised only by ``tests/test_zoom_pass.py``.
+The caller is Discern's ``Sam3Backend.refine_all_frames``, which asks
+:func:`plan_zoom_pass_frame` for each frame's windows and records one
+:class:`MaskOutcomeRecord` per (frame, Object) into a :class:`ZoomPassReport`, in
+place of the shared-union-window, whole-pass-abandonment, clone-fallback code that
+used to live there. Its name is the legacy spelling this vocabulary replaces; the
+mapping is recorded here so it stays findable rather than being carried into new
+type names.
 
 Anchoring, and how it differs from propagation
 ----------------------------------------------
