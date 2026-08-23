@@ -246,6 +246,81 @@ def test_nothing_is_re_grounded_once_every_object_has_stopped():
     assert not ledger.should_re_ground(16)
 
 
+def test_a_skipped_tick_is_reported_as_the_cadence_the_annotator_actually_got():
+    """One request in flight at a time: a slow provider stretches the interval."""
+    ledger = _ledger(seed_frame=10, config=ZoomAnchorConfig(re_grounding_interval=5))
+
+    for frame in range(11, 27):
+        if ledger.should_re_ground(frame) and frame != 11:
+            ledger.note_tick_skipped(frame)
+
+    assert ledger.effective_re_grounding_interval() == 20.0
+    assert "ticks_skipped=3" in ledger.pass_summary()
+
+
+def test_the_effective_cadence_is_the_configured_one_when_no_tick_is_skipped():
+    ledger = _ledger(seed_frame=10, config=ZoomAnchorConfig(re_grounding_interval=5))
+
+    for frame in range(11, 27):
+        ledger.should_re_ground(frame)
+
+    assert ledger.effective_re_grounding_interval() == 5.0
+
+
+def test_no_tick_has_come_round_yet_reports_no_cadence_rather_than_a_made_up_one():
+    assert _ledger().effective_re_grounding_interval() is None
+
+
+# ---------------------------------------------------------------------------
+# How late a Re-grounding answer may be -- requests are never waited on
+# ---------------------------------------------------------------------------
+
+
+def test_an_answer_about_the_frame_just_processed_still_anchors_this_frame():
+    ledger = _ledger(seed_frame=10)
+    fresh, aged = ledger.classify_re_grounding({1: (200, 200, 500, 500)}, 11, 12)
+
+    assert fresh == {1: (200, 200, 500, 500)}
+    assert aged == {}
+
+
+def test_an_answer_that_arrived_too_late_loses_to_the_objects_own_mask():
+    """A 15-frame-old box is where the Object *was*, and the mask is where it is."""
+    ledger = _ledger(seed_frame=10)
+    fresh, aged = ledger.classify_re_grounding({1: (0, 0, 300, 300)}, 11, 26)
+    assert fresh == {} and aged == {1: (0, 0, 300, 300)}
+
+    anchors = ledger.resolve(fresh)
+    record = ledger.record_frame(
+        26, anchors, {1: _observe((410, 410, 710, 710))}, {**fresh, **aged}
+    )
+
+    assert record.anchor_sources == {1: ZoomAnchorSource.MASK_DERIVED.value}
+    assert anchors[1].window.center == (550.0, 550.0)
+
+
+def test_an_answer_that_arrived_too_late_is_still_kept_as_the_stale_box():
+    """It beats knowing nothing at all, which is the tier the precedence gives it."""
+    ledger = _ledger(seed_frame=10)
+    fresh, aged = ledger.classify_re_grounding({1: (100, 100, 300, 300)}, 11, 26)
+    anchors = ledger.resolve(fresh)
+    ledger.record_frame(26, anchors, {1: None}, {**fresh, **aged})
+
+    anchors = ledger.resolve()
+
+    assert anchors[1].source is ZoomAnchorSource.STALE
+    window = anchors[1].window
+    assert window.x1 <= 100 and window.x2 >= 300
+    assert window.y1 <= 100 and window.y2 >= 300
+
+
+def test_late_answers_are_counted_in_the_pass_summary():
+    ledger = _ledger(seed_frame=10)
+    ledger.classify_re_grounding({1: (100, 100, 300, 300)}, 11, 26)
+
+    assert "re_groundings_too_late=1" in ledger.pass_summary()
+
+
 # ---------------------------------------------------------------------------
 # Pass restart
 # ---------------------------------------------------------------------------

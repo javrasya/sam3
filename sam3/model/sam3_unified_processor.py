@@ -1708,8 +1708,11 @@ class Sam3UnifiedProcessor:
         Zoom Pass, and duplicating them here is how the two drifted apart before.
 
         Re-grounding requests are submitted to a background worker and never
-        waited on: the frame stream keeps flowing while the vision model thinks,
-        and the answer is applied to the first frame after it arrives.
+        waited on: the frame stream keeps flowing while the vision model thinks.
+        An answer anchors the frame it arrives on only while it is still recent
+        enough to describe where the Object is now; an answer about a frame the
+        pass left behind is kept as that Object's stale box, which the resolver
+        ranks below the Object's own current mask.
 
         When SAM3 finds nothing for an Object, that Object is reported absent on
         that frame -- an all-zero mask, a score of 0.0, and its id listed in
@@ -1855,7 +1858,11 @@ class Sam3UnifiedProcessor:
 
                 # Collect a Re-grounding answer that arrived since the last frame.
                 # Never blocks: an unfinished request is simply not ready yet.
-                re_grounding = None
+                # ``fresh`` may anchor this frame; ``aged`` describes a frame the
+                # pass has already left behind, so it is only remembered as each
+                # Object's stale box -- the ledger draws that line.
+                fresh_re_grounding = {}
+                aged_re_grounding = {}
                 if pending is not None and pending.done():
                     # Any exception raised on the worker surfaces here rather
                     # than being swallowed; re_ground_objects itself only raises
@@ -1872,11 +1879,25 @@ class Sam3UnifiedProcessor:
                             f"({result.failures}); windows follow each Object's own "
                             "mask until a later tick succeeds"
                         )
-                    re_grounding, rejected = partition_re_grounding(result)
+                    accepted, rejected = partition_re_grounding(result)
                     if rejected:
                         logger.warning(
                             f"[ZOOM] frame {frame_idx}: discarded malformed "
                             f"Re-grounding boxes {rejected}"
+                        )
+                    fresh_re_grounding, aged_re_grounding = (
+                        ledger.classify_re_grounding(
+                            accepted, pending_frame, frame_idx
+                        )
+                    )
+                    if aged_re_grounding:
+                        logger.warning(
+                            f"[ZOOM] frame {frame_idx}: the Re-grounding answer "
+                            f"about frame {pending_frame} arrived "
+                            f"{abs(frame_idx - pending_frame)} frames late, so it "
+                            "no longer says where these Objects are now; it is "
+                            "kept only as their stale box, below their own masks. "
+                            "The vision model is slower than this frame rate"
                         )
 
                 # A tick submits a request and moves on. The cadence is a function
@@ -1884,10 +1905,22 @@ class Sam3UnifiedProcessor:
                 # next tick instead of retrying on every frame.
                 if ledger.should_re_ground(frame_idx):
                     if pending is not None:
-                        logger.info(
+                        # One request in flight at a time, so a provider slower
+                        # than the interval stretches it. Nothing here can speed
+                        # the provider up, but the annotator chose a number and is
+                        # entitled to know it is not the number they got.
+                        skipped = ledger.note_tick_skipped(frame_idx)
+                        effective = ledger.effective_re_grounding_interval()
+                        effective_text = (
+                            "unknown" if effective is None else f"{effective:.1f}"
+                        )
+                        logger.warning(
                             f"[ZOOM] frame {frame_idx}: Re-grounding tick skipped, "
                             f"the request from frame {pending_frame} is still in "
-                            "flight"
+                            f"flight ({skipped} skipped so far); the chosen "
+                            f"interval of {anchor_config.re_grounding_interval} "
+                            f"frames is running at {effective_text} frames per "
+                            "request"
                         )
                     else:
                         # Every active Object is asked about, including the ones
@@ -1910,7 +1943,7 @@ class Sam3UnifiedProcessor:
                             curr_frame,
                         )
 
-                anchors = ledger.resolve(re_grounding)
+                anchors = ledger.resolve(fresh_re_grounding)
 
                 # Process each object: crop, detect, map back
                 frame_masks_full = {}
@@ -1941,11 +1974,21 @@ class Sam3UnifiedProcessor:
 
                     observation = None
                     if crop_masks is not None and len(crop_masks) > 0:
-                        best_idx = 0
-                        best_score = 1.0
-                        if crop_scores is not None and len(crop_scores) > 0:
-                            best_idx = crop_scores.argmax().item()
-                            best_score = crop_scores[best_idx].item()
+                        if crop_scores is None or len(crop_scores) == 0:
+                            # A detection SAM3 scored nothing for has no
+                            # confidence to report. Defaulting it to 1.0 made an
+                            # unscored mask outrank every genuinely scored one --
+                            # the dishonest scoring this feature is being cured
+                            # of. Masks and scores come out of the same filter, so
+                            # one without the other is a programming error here.
+                            raise RuntimeError(
+                                f"frame {frame_idx}, object {obj_id}: cropped "
+                                f"detection returned {len(crop_masks)} mask(s) "
+                                "with no scores; refusing to invent a confidence "
+                                "for them"
+                            )
+                        best_idx = crop_scores.argmax().item()
+                        best_score = crop_scores[best_idx].item()
 
                         full_mask = self._paste_mask_back(
                             crop_masks[best_idx].unsqueeze(0),
@@ -1974,7 +2017,10 @@ class Sam3UnifiedProcessor:
                     prev_masks_per_obj[obj_id] = frame_masks_full.get(obj_id)
 
                 record = ledger.record_frame(
-                    frame_idx, anchors, observations, re_grounding
+                    frame_idx,
+                    anchors,
+                    observations,
+                    {**fresh_re_grounding, **aged_re_grounding},
                 )
 
                 # Assemble frame results. Objects with no mask -- found nothing, or
