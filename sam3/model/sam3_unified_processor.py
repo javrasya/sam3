@@ -18,6 +18,7 @@ Memory efficient: The backbone is loaded once and shared between both paths.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -32,6 +33,21 @@ from sam3.logger import get_logger
 from sam3.model.box_ops import box_cxcywh_to_xyxy
 from sam3.model.data_misc import FindStage, interpolate
 from sam3.model.geometry_encoders import Prompt
+
+# DISCERN FORK LOCAL ADDITION -- the Zoom Anchor resolver and the per-Object
+# bookkeeping around it are local to javrasya/sam3 (see Discern ADR 0002).
+from sam3.zoom_anchor import (
+    FORWARD,
+    ObjectZoomState,
+    ZoomAnchorConfig,
+    plan_processing_passes,
+)
+from sam3.zoom_propagation import (
+    DEFAULT_ABSENCE_STREAK_LIMIT,
+    MaskObservation,
+    PassLedger,
+    partition_re_grounding,
+)
 
 logger = get_logger(__name__)
 
@@ -1651,48 +1667,90 @@ class Sam3UnifiedProcessor:
 
     # ═══════════════════════════════════════════════════════════════════════
     # LLM-GUIDED CROP PROPAGATION
-    # Optional mode: crop each frame around predicted object location
-    # before running tracker, improving small object segmentation quality.
+    # DISCERN FORK LOCAL ADDITION -- not part of upstream SAM3
+    # (see Discern ADR 0002).
+    #
+    # Optional mode: every frame is detected afresh inside a per-Object Zoom
+    # Window, guided only by that Object's mask from the neighbouring frame.
+    # There is deliberately NO tracker on this path -- that absence is the
+    # defining property of Chained Detection, and it is why memory here is
+    # exactly one frame. Use propagate() when you want tracked propagation.
     # ═══════════════════════════════════════════════════════════════════════
 
+    # DISCERN FORK LOCAL ADDITION
     @torch.inference_mode()
     def propagate_with_llm_crop(
         self,
         state: Dict,
         llm_advisor,
         object_descriptions: Union[str, Dict[int, str]] = None,
-        direction: str = "forward",
+        direction: str = FORWARD,
         llm_every_n_frames: int = 1,
         crop_padding: float = 0.5,
         stream: bool = False,
+        absence_streak_limit: int = DEFAULT_ABSENCE_STREAK_LIMIT,
+        zoom_anchor_config: Optional[ZoomAnchorConfig] = None,
     ):
         """
-        Propagate masks through video using LLM-guided per-frame cropping.
+        Propagate masks through video by Chained Detection inside Zoom Windows.
 
-        Before each frame enters the tracker backbone, an LLM predicts where
-        the object will be. The frame is cropped around that prediction and
-        resized to model resolution (1008x1008), giving small objects much
-        higher effective resolution. Masks are mapped back to full frame
-        coordinates afterward.
+        Each frame is cropped around one Object at a time and resized to model
+        resolution, giving small Objects much higher effective resolution; the
+        resulting mask is mapped back to full-frame coordinates. No tracker is
+        involved and no memory survives beyond the previous frame, so this is
+        detection chained frame to frame rather than tracking.
 
-        This is an OPTIONAL mode. Use propagate() for standard full-frame tracking.
+        Every decision about *where* a Zoom Window goes, and about which frames
+        are processed in which order, belongs to :mod:`sam3.zoom_anchor`; the
+        per-Object bookkeeping around it belongs to :mod:`sam3.zoom_propagation`.
+        Nothing about window geometry, anchor precedence, tick cadence or the
+        guards is decided in this method -- the same decisions serve Discern's
+        Zoom Pass, and duplicating them here is how the two drifted apart before.
+
+        Re-grounding requests are submitted to a background worker and never
+        waited on: the frame stream keeps flowing while the vision model thinks.
+        An answer anchors the frame it arrives on only while it is still recent
+        enough to describe where the Object is now; an answer about a frame the
+        pass left behind is kept as that Object's stale box, which the resolver
+        ranks below the Object's own current mask.
+
+        When SAM3 finds nothing for an Object, that Object is reported absent on
+        that frame -- an all-zero mask, a score of 0.0, and its id listed in
+        ``absent_obj_ids``. The previous frame's mask is never cloned into its
+        place, neither as the answer nor as the next frame's guidance. An Object
+        absent for ``absence_streak_limit`` consecutive frames stops being
+        propagated for the remainder of that pass.
 
         Args:
             state: State from add_prompt_on_frame() or set_seed_masks()
-            llm_advisor: LLMCropAdvisor instance for crop zone prediction
-            object_descriptions: Optional text descriptions of tracked objects.
-                str for single description, or dict {obj_id: str} per object.
-            direction: "forward" or "backward" (default "forward")
-            llm_every_n_frames: How often to call the LLM (1=every frame,
-                2=every other frame with interpolation, etc.)
-            crop_padding: Extra padding factor around LLM-predicted crops
+            llm_advisor: LLMCropAdvisor instance, asked to re-locate Objects
+            object_descriptions: Object Hints. str for a single description, or
+                dict {obj_id: str} per Object.
+            direction: "forward", "backward" or "both". Unknown values raise.
+            llm_every_n_frames: Re-grounding tick cadence. N means a request
+                every N frames, counting from the first frame of each pass.
+            crop_padding: Fraction of the Object's longest side added on each
+                side of its Zoom Window.
             stream: If True, yields (frame_idx, masks_dict, state) per frame.
                    If False, collects all results and returns state.
+            absence_streak_limit: Consecutive absent frames after which an Object
+                stops being propagated for the rest of the pass.
+            zoom_anchor_config: Full resolver configuration. When given it wins
+                over crop_padding and llm_every_n_frames.
 
         Returns/Yields:
             If stream=False: State with propagated_masks populated
-            If stream=True: Generator yielding (frame_idx, masks_dict, state) tuples
+            If stream=True: Generator yielding (frame_idx, masks_dict, state)
+
+            ``masks_dict`` carries the usual ``obj_ids`` / ``masks`` / ``scores``
+            plus three fork-local keys: ``anchor_sources`` ({obj_id: which Zoom
+            Anchor produced this frame's window}), ``absent_obj_ids`` and
+            ``stopped_obj_ids``. They are additive -- consumers that do not know
+            them are unaffected -- and they are what makes a run that quietly
+            degraded to the full frame distinguishable from one that worked.
         """
+        from sam3.agent.helpers.frame_renderer import mask_to_bbox
+
         if "video_source" not in state:
             raise ValueError("Must call set_video before propagate_with_llm_crop")
 
@@ -1702,6 +1760,11 @@ class Sam3UnifiedProcessor:
         num_frames = state["num_frames"]
         orig_h = state["orig_height"]
         orig_w = state["orig_width"]
+
+        anchor_config = zoom_anchor_config or ZoomAnchorConfig(
+            crop_padding=crop_padding,
+            re_grounding_interval=llm_every_n_frames,
+        )
 
         # Determine seed frames and initial masks
         cond_frames = set(state.get("frame_masks", {}).keys()) | set(
@@ -1714,18 +1777,15 @@ class Sam3UnifiedProcessor:
             state, start_frame, orig_h, orig_w
         )
 
-        # Processing order
-        if direction == "backward":
-            processing_order = list(range(start_frame - 1, -1, -1))
-        else:
-            processing_order = list(range(start_frame + 1, num_frames))
+        # Processing order comes from the resolver, which knows all three
+        # directions. Treating "anything that is not backward" as forward is what
+        # silently dropped every frame before a mid-clip seed frame.
+        passes = plan_processing_passes(start_frame, num_frames, direction)
 
         state["propagated_masks"] = {}
 
         # Store seed frame results
-        seed_masks_tensor = torch.stack(
-            [initial_masks[oid] for oid in obj_ids]
-        )
+        seed_masks_tensor = torch.stack([initial_masks[oid] for oid in obj_ids])
         seed_scores = torch.ones(len(obj_ids))
         state["propagated_masks"][start_frame] = {
             "obj_ids": list(obj_ids),
@@ -1733,195 +1793,246 @@ class Sam3UnifiedProcessor:
             "scores": seed_scores,
         }
 
-        def _propagate_with_crop_generator():
-            # Track per-object state across frames
-            prev_masks_per_obj = dict(initial_masks)  # {obj_id: mask_tensor}
-            prev_bboxes_per_obj = dict(initial_bboxes)  # {obj_id: (x1,y1,x2,y2)}
-            last_llm_crops = None  # {obj_id: (x1,y1,x2,y2)}
-            frames_since_llm = 0
-
-            # Get previous frame for first LLM call
-            prev_frame = self._get_frame(state, start_frame)
-
-            # Initialize a fresh tracker for crop-space tracking
-            # We re-initialize per frame since each crop is different
-            logger.debug(
-                f"Starting LLM-guided crop propagation: {len(processing_order)} frames, "
-                f"{len(obj_ids)} objects"
-            )
-
-            for frame_idx in tqdm(processing_order, desc="propagate with LLM crop"):
-                curr_frame = self._get_frame(state, frame_idx)
-                if curr_frame is None:
-                    logger.warning(f"Could not read frame {frame_idx}, skipping")
-                    continue
-
-                # Determine crop zones for this frame
-                need_llm = (
-                    frames_since_llm >= llm_every_n_frames or last_llm_crops is None
+        # The state every pass starts from. Both passes start from the Seed
+        # Masks, which is the whole reason the resolver hands back two of them.
+        seed_states = {}
+        for obj_id in obj_ids:
+            bbox = initial_bboxes.get(obj_id)
+            if bbox is None:
+                seed_states[obj_id] = ObjectZoomState()
+            else:
+                seed_states[obj_id] = ObjectZoomState(
+                    previous_bbox=self._exclusive_bbox(bbox),
+                    previous_mask_area=int((initial_masks[obj_id] > 0.5).sum().item()),
                 )
 
-                crop_zones = None
-                if need_llm:
-                    # Call LLM for crop zone prediction
-                    crop_zones = llm_advisor.predict_crop_zones(
-                        prev_frame=prev_frame,
-                        prev_masks=prev_masks_per_obj,
-                        prev_bboxes=prev_bboxes_per_obj,
-                        curr_frame=curr_frame,
-                        object_descriptions=object_descriptions,
+        def _request_re_grounding(
+            prev_frame, object_ids_to_ask, prev_masks, prev_bboxes, curr_frame
+        ):
+            """Runs on the background worker; no torch, no shared mutable state.
+
+            One request per Object is issued inside ``re_ground_objects``, which
+            also owns the timeout and the concurrency. An Object with no mask on
+            the previous frame is still asked about as long as it has an Object
+            Hint -- that is the case Re-grounding exists for.
+            """
+            return llm_advisor.re_ground_objects(
+                prev_frame=prev_frame,
+                curr_frame=curr_frame,
+                object_ids=object_ids_to_ask,
+                prev_masks=prev_masks,
+                prev_bboxes=prev_bboxes,
+                object_hints=object_descriptions,
+            )
+
+        def _run_pass(pass_, executor):
+            ledger = PassLedger(
+                seed_states=seed_states,
+                seed_frame=start_frame,
+                frame_width=orig_w,
+                frame_height=orig_h,
+                config=anchor_config,
+                absence_streak_limit=absence_streak_limit,
+            )
+            prev_masks_per_obj = dict(initial_masks)
+            prev_frame = self._get_frame(state, start_frame)
+            pending = None
+            pending_frame = None
+            last_summary = None
+
+            logger.info(
+                f"[ZOOM] {pass_.direction} pass over {len(pass_.frames)} frames, "
+                f"{len(obj_ids)} objects, Re-grounding every "
+                f"{anchor_config.re_grounding_interval} frames"
+            )
+
+            for frame_idx in tqdm(
+                pass_.frames, desc=f"propagate with LLM crop ({pass_.direction})"
+            ):
+                curr_frame = self._get_frame(state, frame_idx)
+                if curr_frame is None:
+                    raise RuntimeError(
+                        f"Could not read frame {frame_idx} of {num_frames}; "
+                        "refusing to drop it silently from the propagation"
                     )
-                    if crop_zones is not None:
-                        last_llm_crops = crop_zones
-                        frames_since_llm = 0
-                    else:
-                        logger.debug(
-                            f"Frame {frame_idx}: LLM failed, using fallback crops"
-                        )
-                        frames_since_llm += 1
-                else:
-                    frames_since_llm += 1
 
-                # Build per-object crop zones (with fallback)
-                frame_crop_zones = {}
-                for obj_id in obj_ids:
-                    if crop_zones and obj_id in crop_zones:
-                        frame_crop_zones[obj_id] = crop_zones[obj_id]
-                    elif last_llm_crops and obj_id in last_llm_crops:
-                        # Use last known LLM crop
-                        frame_crop_zones[obj_id] = last_llm_crops[obj_id]
-                    elif obj_id in prev_bboxes_per_obj and prev_bboxes_per_obj[obj_id] is not None:
-                        # Fallback: expand previous bbox
-                        frame_crop_zones[obj_id] = llm_advisor.fallback_crop(
-                            prev_bboxes_per_obj[obj_id],
-                            orig_h,
-                            orig_w,
-                            padding=crop_padding * 2,  # extra padding for fallback
+                # Collect a Re-grounding answer that arrived since the last frame.
+                # Never blocks: an unfinished request is simply not ready yet.
+                # ``fresh`` may anchor this frame; ``aged`` describes a frame the
+                # pass has already left behind, so it is only remembered as each
+                # Object's stale box -- the ledger draws that line.
+                fresh_re_grounding = {}
+                aged_re_grounding = {}
+                if pending is not None and pending.done():
+                    # Any exception raised on the worker surfaces here rather
+                    # than being swallowed; re_ground_objects itself only raises
+                    # when it was asked something it cannot answer at all.
+                    result = pending.result()
+                    pending = None
+                    if result.every_request_failed:
+                        # Not a scene the model could not read -- a provider that
+                        # answered nothing at all. Say so in the operator's words
+                        # instead of letting it look like a run with no Objects.
+                        logger.error(
+                            f"[ZOOM] frame {frame_idx}: every Re-grounding request "
+                            f"made on frame {pending_frame} failed "
+                            f"({result.failures}); windows follow each Object's own "
+                            "mask until a later tick succeeds"
+                        )
+                    accepted, rejected = partition_re_grounding(result)
+                    if rejected:
+                        logger.warning(
+                            f"[ZOOM] frame {frame_idx}: discarded malformed "
+                            f"Re-grounding boxes {rejected}"
+                        )
+                    fresh_re_grounding, aged_re_grounding = (
+                        ledger.classify_re_grounding(
+                            accepted, pending_frame, frame_idx
+                        )
+                    )
+                    if aged_re_grounding:
+                        logger.warning(
+                            f"[ZOOM] frame {frame_idx}: the Re-grounding answer "
+                            f"about frame {pending_frame} arrived "
+                            f"{abs(frame_idx - pending_frame)} frames late, so it "
+                            "no longer says where these Objects are now; it is "
+                            "kept only as their stale box, below their own masks. "
+                            "The vision model is slower than this frame rate"
+                        )
+
+                # A tick submits a request and moves on. The cadence is a function
+                # of the frame index, so a skipped or failed request waits for the
+                # next tick instead of retrying on every frame.
+                if ledger.should_re_ground(frame_idx):
+                    if pending is not None:
+                        # One request in flight at a time, so a provider slower
+                        # than the interval stretches it. Nothing here can speed
+                        # the provider up, but the annotator chose a number and is
+                        # entitled to know it is not the number they got.
+                        skipped = ledger.note_tick_skipped(frame_idx)
+                        effective = ledger.effective_re_grounding_interval()
+                        effective_text = (
+                            "unknown" if effective is None else f"{effective:.1f}"
+                        )
+                        logger.warning(
+                            f"[ZOOM] frame {frame_idx}: Re-grounding tick skipped, "
+                            f"the request from frame {pending_frame} is still in "
+                            f"flight ({skipped} skipped so far); the chosen "
+                            f"interval of {anchor_config.re_grounding_interval} "
+                            f"frames is running at {effective_text} frames per "
+                            "request"
                         )
                     else:
-                        # No info at all: use full frame
-                        frame_crop_zones[obj_id] = (0, 0, orig_w, orig_h)
+                        # Every active Object is asked about, including the ones
+                        # with no mask left: an Object the chain lost is exactly
+                        # what its Object Hint is for. re_ground_objects decides
+                        # per Object whether there is anything to ask with, and
+                        # reports NOT_ASKED for the ones there is not.
+                        request_masks = {
+                            obj_id: prev_masks_per_obj[obj_id]
+                            for obj_id in ledger.active_object_ids
+                            if prev_masks_per_obj.get(obj_id) is not None
+                        }
+                        pending_frame = frame_idx
+                        pending = executor.submit(
+                            _request_re_grounding,
+                            prev_frame,
+                            ledger.active_object_ids,
+                            request_masks,
+                            ledger.previous_bboxes(),
+                            curr_frame,
+                        )
 
-                # Process each object: crop, track, map back
+                anchors = ledger.resolve(fresh_re_grounding)
+
+                # Process each object: crop, detect, map back
                 frame_masks_full = {}
                 frame_scores = {}
+                observations = {}
 
-                for obj_id in obj_ids:
-                    crop_zone = frame_crop_zones[obj_id]
-                    cx1, cy1, cx2, cy2 = crop_zone
+                for obj_id in ledger.active_object_ids:
+                    window = anchors[obj_id].window
+                    cropped_frame = self._crop_frame_to_window(curr_frame, window)
+                    cropped_prev_mask = self._crop_mask_to_window(
+                        prev_masks_per_obj.get(obj_id), window
+                    )
 
-                    # Ensure minimum crop size
-                    crop_w = cx2 - cx1
-                    crop_h = cy2 - cy1
-                    if crop_w < 32 or crop_h < 32:
-                        # Too small, expand
-                        cx_center = (cx1 + cx2) // 2
-                        cy_center = (cy1 + cy2) // 2
-                        half = max(32, crop_w, crop_h)
-                        cx1 = max(0, cx_center - half)
-                        cy1 = max(0, cy_center - half)
-                        cx2 = min(orig_w, cx_center + half)
-                        cy2 = min(orig_h, cy_center + half)
-                        crop_zone = (cx1, cy1, cx2, cy2)
+                    crop_state = self.set_image(cropped_frame)
 
-                    # Crop current frame
-                    if isinstance(curr_frame, np.ndarray):
-                        cropped_frame = curr_frame[cy1:cy2, cx1:cx2].copy()
-                    elif isinstance(curr_frame, PIL.Image.Image):
-                        cropped_frame = np.array(curr_frame)[cy1:cy2, cx1:cx2].copy()
-                    else:
-                        cropped_frame = curr_frame[..., cy1:cy2, cx1:cx2].clone()
+                    text_prompt = state.get("text_prompt")
+                    if text_prompt:
+                        crop_state = self.set_text_prompt(text_prompt, crop_state)
 
-                    # Also crop previous mask into crop space for re-initialization
-                    prev_mask = prev_masks_per_obj.get(obj_id)
-                    if prev_mask is not None:
-                        if isinstance(prev_mask, torch.Tensor):
-                            prev_mask_np = prev_mask.cpu().numpy()
-                        else:
-                            prev_mask_np = prev_mask
-                        prev_mask_np = prev_mask_np.squeeze()
-                        cropped_prev_mask = prev_mask_np[cy1:cy2, cx1:cx2]
-                    else:
-                        cropped_prev_mask = None
+                    if cropped_prev_mask is not None and cropped_prev_mask.any():
+                        mask_tensor = torch.from_numpy(
+                            cropped_prev_mask.astype(np.float32)
+                        ).unsqueeze(0)
+                        crop_state = self.add_mask_prompt(mask_tensor, crop_state)
 
-                    # Run detection on cropped frame with mask guidance
-                    try:
-                        crop_state = self.set_image(cropped_frame)
+                    crop_masks = crop_state.get("masks")
+                    crop_scores = crop_state.get("scores")
 
-                        # Use text prompt if available
-                        text_prompt = state.get("text_prompt")
-                        if text_prompt:
-                            crop_state = self.set_text_prompt(text_prompt, crop_state)
-
-                        # Use mask guidance
-                        if cropped_prev_mask is not None and cropped_prev_mask.any():
-                            mask_tensor = torch.from_numpy(
-                                cropped_prev_mask.astype(np.float32)
-                            ).unsqueeze(0)
-                            crop_state = self.add_mask_prompt(mask_tensor, crop_state)
-
-                        crop_masks = crop_state.get("masks")
-                        crop_scores = crop_state.get("scores")
-
-                        if crop_masks is not None and len(crop_masks) > 0:
-                            # Take best mask
-                            best_idx = 0
-                            if crop_scores is not None and len(crop_scores) > 0:
-                                best_idx = crop_scores.argmax().item()
-
-                            best_mask_crop = crop_masks[best_idx]
-                            best_score = (
-                                crop_scores[best_idx].item()
-                                if crop_scores is not None
-                                else 1.0
+                    observation = None
+                    if crop_masks is not None and len(crop_masks) > 0:
+                        if crop_scores is None or len(crop_scores) == 0:
+                            # A detection SAM3 scored nothing for has no
+                            # confidence to report. Defaulting it to 1.0 made an
+                            # unscored mask outrank every genuinely scored one --
+                            # the dishonest scoring this feature is being cured
+                            # of. Masks and scores come out of the same filter, so
+                            # one without the other is a programming error here.
+                            raise RuntimeError(
+                                f"frame {frame_idx}, object {obj_id}: cropped "
+                                f"detection returned {len(crop_masks)} mask(s) "
+                                "with no scores; refusing to invent a confidence "
+                                "for them"
                             )
+                        best_idx = crop_scores.argmax().item()
+                        best_score = crop_scores[best_idx].item()
 
-                            # Map mask back to full frame
-                            full_mask = self._paste_mask_back(
-                                best_mask_crop.unsqueeze(0),
-                                crop_zone,
-                                (orig_h, orig_w),
-                            ).squeeze(0)
-
-                            frame_masks_full[obj_id] = full_mask
+                        full_mask = self._paste_mask_back(
+                            crop_masks[best_idx].unsqueeze(0),
+                            window.as_tuple(),
+                            (orig_h, orig_w),
+                        ).squeeze(0)
+                        binary = (full_mask > 0.5).cpu()
+                        bbox = mask_to_bbox(binary)
+                        if bbox is not None:
+                            observation = MaskObservation(
+                                bbox=self._exclusive_bbox(bbox),
+                                area=int(binary.sum().item()),
+                            )
+                            frame_masks_full[obj_id] = binary
                             frame_scores[obj_id] = best_score
-                        else:
-                            # Detection failed in crop, keep previous mask
-                            logger.debug(
-                                f"Frame {frame_idx}, obj {obj_id}: "
-                                "no mask from cropped detection, keeping previous"
-                            )
-                            if prev_mask is not None:
-                                frame_masks_full[obj_id] = (
-                                    prev_mask
-                                    if isinstance(prev_mask, torch.Tensor)
-                                    else torch.from_numpy(prev_mask)
-                                )
-                                frame_scores[obj_id] = 0.5
-                    except Exception as e:
-                        logger.warning(
-                            f"Frame {frame_idx}, obj {obj_id}: "
-                            f"detection in crop failed: {e}"
-                        )
-                        if prev_mask is not None:
-                            frame_masks_full[obj_id] = (
-                                prev_mask
-                                if isinstance(prev_mask, torch.Tensor)
-                                else torch.from_numpy(prev_mask)
-                            )
-                            frame_scores[obj_id] = 0.3
 
-                # Assemble frame results
+                    if observation is None:
+                        logger.debug(
+                            f"[ZOOM] frame {frame_idx}, object {obj_id}: no mask "
+                            "from cropped detection, reported absent"
+                        )
+                    observations[obj_id] = observation
+
+                    # Absent means absent: the previous mask is not cloned into
+                    # this frame's answer, nor reused as the next frame's guidance.
+                    prev_masks_per_obj[obj_id] = frame_masks_full.get(obj_id)
+
+                record = ledger.record_frame(
+                    frame_idx,
+                    anchors,
+                    observations,
+                    {**fresh_re_grounding, **aged_re_grounding},
+                )
+
+                # Assemble frame results. Objects with no mask -- found nothing, or
+                # already stopped -- get an empty mask and a score of 0.0.
                 masks_list = []
                 scores_list = []
                 for obj_id in obj_ids:
                     if obj_id in frame_masks_full:
                         masks_list.append(frame_masks_full[obj_id])
-                        scores_list.append(frame_scores.get(obj_id, 1.0))
+                        scores_list.append(frame_scores[obj_id])
                     else:
-                        masks_list.append(
-                            torch.zeros(orig_h, orig_w, dtype=torch.bool)
-                        )
+                        masks_list.append(torch.zeros(orig_h, orig_w, dtype=torch.bool))
                         scores_list.append(0.0)
 
                 masks_tensor = torch.stack(masks_list).cpu()
@@ -1931,24 +2042,60 @@ class Sam3UnifiedProcessor:
                     "obj_ids": list(obj_ids),
                     "masks": (masks_tensor > 0.5),
                     "scores": scores_tensor,
+                    # DISCERN FORK LOCAL ADDITION -- the per-frame Zoom Anchor
+                    # record and the absence signal.
+                    "anchor_sources": record.anchor_sources,
+                    "absent_obj_ids": list(record.absent_obj_ids),
+                    "stopped_obj_ids": list(record.stopped_obj_ids),
                 }
                 state["propagated_masks"][frame_idx] = masks_dict
 
-                # Update per-object state for next frame
-                from sam3.agent.helpers.frame_renderer import mask_to_bbox
+                # Log the anchor record whenever it changes, so a run that
+                # degraded to stale or full-frame windows says so at INFO rather
+                # than looking exactly like a successful one.
+                summary = record.summary()
+                if summary != last_summary:
+                    logger.info(f"[ZOOM] frame {frame_idx}: {summary}")
+                    last_summary = summary
+                else:
+                    logger.debug(f"[ZOOM] frame {frame_idx}: {summary}")
 
-                for i, obj_id in enumerate(obj_ids):
-                    if obj_id in frame_masks_full:
-                        prev_masks_per_obj[obj_id] = frame_masks_full[obj_id]
-                        bbox = mask_to_bbox(frame_masks_full[obj_id])
-                        prev_bboxes_per_obj[obj_id] = bbox
-                    # else: keep previous
+                for obj_id in record.newly_stopped_obj_ids:
+                    logger.warning(
+                        f"[ZOOM] object {obj_id} absent for {absence_streak_limit} "
+                        f"consecutive frames at frame {frame_idx}; it stops being "
+                        f"propagated for the rest of the {pass_.direction} pass"
+                    )
 
                 prev_frame = curr_frame
 
                 yield frame_idx, masks_dict, state
 
-            state["propagation_done"] = True
+                if not ledger.active_object_ids:
+                    logger.warning(
+                        f"[ZOOM] every object has stopped at frame {frame_idx}; "
+                        f"ending the {pass_.direction} pass early"
+                    )
+                    break
+
+            logger.info(
+                f"[ZOOM] {pass_.direction} pass anchors: {ledger.pass_summary()}"
+            )
+
+        def _propagate_with_crop_generator():
+            # One background worker. A Re-grounding tick is submitted to it and
+            # never awaited, so no frame waits on the vision model and the caller
+            # keeps seeing progress (a synchronous call on the first frame used to
+            # be able to outlast the API's first-frame guard entirely).
+            executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sam3-re-grounding"
+            )
+            try:
+                for pass_ in passes:
+                    yield from _run_pass(pass_, executor)
+                state["propagation_done"] = True
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
         if stream:
             return _propagate_with_crop_generator()
@@ -1956,6 +2103,48 @@ class Sam3UnifiedProcessor:
             for _ in _propagate_with_crop_generator():
                 pass
             return state
+
+    # DISCERN FORK LOCAL ADDITION
+    @staticmethod
+    def _exclusive_bbox(bbox):
+        """Convert an inclusive (x1, y1, x2, y2) to the resolver's exclusive one.
+
+        ``mask_to_bbox`` reports the last row and column *occupied*; everything in
+        :mod:`sam3.zoom_anchor` and every slice below treats x2/y2 as one past the
+        end. Getting this wrong loses a pixel of the Object per frame.
+        """
+        x1, y1, x2, y2 = bbox
+        return (int(x1), int(y1), int(x2) + 1, int(y2) + 1)
+
+    # DISCERN FORK LOCAL ADDITION
+    @staticmethod
+    def _crop_frame_to_window(frame, window):
+        """Cut a Zoom Window out of a frame, as something set_image reads correctly.
+
+        A numpy frame is HWC, and ``set_image`` derives its dimensions from
+        ``shape[-2:]`` -- which on HWC is (width, channels). Handing it a numpy
+        crop therefore makes the model resize its mask to a three-pixel-wide image
+        and stretch that back across the whole window, so no amount of correct
+        window placement could produce a usable mask. PIL carries its size
+        explicitly, so the crop is handed over as PIL.
+        """
+        x1, y1, x2, y2 = window.as_tuple()
+        if isinstance(frame, PIL.Image.Image):
+            return frame.crop((x1, y1, x2, y2))
+        if isinstance(frame, np.ndarray):
+            return PIL.Image.fromarray(frame[y1:y2, x1:x2].astype(np.uint8))
+        return frame[..., y1:y2, x1:x2].clone()
+
+    # DISCERN FORK LOCAL ADDITION
+    @staticmethod
+    def _crop_mask_to_window(mask, window):
+        """Cut the same Zoom Window out of a full-frame mask, as numpy."""
+        if mask is None:
+            return None
+        x1, y1, x2, y2 = window.as_tuple()
+        if isinstance(mask, torch.Tensor):
+            mask = mask.detach().cpu().numpy()
+        return np.squeeze(mask)[y1:y2, x1:x2]
 
     def _extract_per_object_masks(self, state, frame_idx, orig_h, orig_w):
         """
